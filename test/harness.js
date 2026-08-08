@@ -319,6 +319,92 @@ async function main() {
     check('zero disables the limit', () => assert.strictEqual(unlimited.seen.length, 25));
   });
 
+  await section('empty numeric variables fall back to defaults', async () => {
+    // Number('') is 0. Left uncaught, a blank IGNORE_OLDER_THAN_SECONDS treats
+    // every message as backlog and the assistant answers nobody.
+    resetModules({
+      IGNORE_OLDER_THAN_SECONDS: '',
+      MAX_REPLIES_PER_HOUR: '',
+      ASSISTANT_MEMORY_WINDOW: '',
+      OLLAMA_TIMEOUT_MS: '  ',
+    });
+    axiosStub = makeAxios();
+    const { access, assistant, ollama } = require(srcFile('config.js'));
+
+    check('blank IGNORE_OLDER_THAN_SECONDS keeps the default', () =>
+      assert.strictEqual(access.ignoreOlderThanSeconds, 30)
+    );
+    check('blank MAX_REPLIES_PER_HOUR keeps the cap', () =>
+      assert.strictEqual(access.maxRepliesPerHour, 20)
+    );
+    check('blank ASSISTANT_MEMORY_WINDOW keeps memory', () =>
+      assert.strictEqual(assistant.memoryWindow, 20)
+    );
+    check('whitespace OLLAMA_TIMEOUT_MS keeps the timeout', () =>
+      assert.strictEqual(ollama.timeoutMs, 120000)
+    );
+
+    const blanked = bootRunner({ IGNORE_OLDER_THAN_SECONDS: '' });
+    await blanked.deliver({ body: 'hello' });
+    check('a blank backlog window still answers live messages', () =>
+      assert.strictEqual(blanked.seen.length, 1)
+    );
+
+    const garbage = bootRunner({ MAX_REPLIES_PER_HOUR: 'twenty' });
+    for (let i = 0; i < 25; i += 1) await garbage.deliver({ body: `m${i}` });
+    check('an unparseable cap falls back rather than disabling itself', () =>
+      assert.strictEqual(garbage.seen.length, 20)
+    );
+  });
+
+  await section('long running memory stays bounded', async () => {
+    resetModules();
+    axiosStub = makeAxios();
+    const { ConversationStore } = require(srcFile('lib', 'memory.js'));
+    const { RateLimiter } = require(srcFile('lib', 'ratelimit.js'));
+
+    const store = new ConversationStore(4, 10);
+    for (let i = 0; i < 50; i += 1) store.push(`chat-${i}`, 'a line');
+    check('conversations are capped', () => assert.strictEqual(store.conversations.size, 10));
+    check('the most recent conversation survives', () =>
+      assert.deepStrictEqual(store.lines('chat-49'), ['a line'])
+    );
+    check('the oldest conversation is evicted', () =>
+      assert.deepStrictEqual(store.lines('chat-0'), [])
+    );
+
+    store.push('busy', 'one');
+    for (let i = 0; i < 10; i += 1) store.push('busy', `line ${i}`);
+    check('the line window still holds', () =>
+      assert.strictEqual(store.lines('busy').length, 4)
+    );
+
+    const active = new ConversationStore(4, 3);
+    active.push('a', 'x');
+    active.push('b', 'x');
+    active.push('a', 'y');
+    active.push('c', 'x');
+    active.push('d', 'x');
+    check('a conversation still in use is not evicted first', () =>
+      assert.strictEqual(active.lines('a').length, 2)
+    );
+
+    const limiter = new RateLimiter(5);
+    const longAgo = Date.now() - 2 * 60 * 60 * 1000;
+    for (let i = 0; i < 20; i += 1) limiter.allow(`old-${i}`, longAgo);
+    limiter.sweep();
+    check('rate limiter drops conversations that went quiet', () =>
+      assert.strictEqual(limiter.hits.size, 0)
+    );
+
+    const live = new RateLimiter(5);
+    live.allow('recent');
+    live.sweep();
+    check('rate limiter keeps conversations inside the window', () =>
+      assert.strictEqual(live.hits.size, 1)
+    );
+  });
+
   await section('access and backlog filters', async () => {
     const { seen, deliver, client } = bootRunner({ ALLOWED_CONTACTS: 'good@lid' });
 

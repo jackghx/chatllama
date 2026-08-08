@@ -5,7 +5,9 @@ const bool = (v, fallback = false) => {
   return ['1', 'true', 'yes', 'on'].includes(String(v).toLowerCase());
 };
 
+// Number('') is 0, so an empty variable has to be caught before coercion.
 const num = (v, fallback) => {
+  if (v === undefined || String(v).trim() === '') return fallback;
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 };
@@ -16,7 +18,6 @@ const list = (v) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
-/** Falls back rather than throwing, so a typo cannot take the bot offline. */
 const oneOf = (v, allowed, fallback) => {
   const found = String(v || '').toLowerCase();
   return allowed.includes(found) ? found : fallback;
@@ -29,7 +30,6 @@ module.exports = {
   },
 
   access: {
-    // always: reply to every eligible message. prefix: only to commands.
     replyMode: oneOf(process.env.REPLY_MODE, ['always', 'prefix'], 'always'),
     commandPrefix: process.env.COMMAND_PREFIX || '/ai',
 
@@ -37,11 +37,7 @@ module.exports = {
     logUnmatched: bool(process.env.LOG_UNMATCHED, false),
     ignoreOlderThanSeconds: num(process.env.IGNORE_OLDER_THAN_SECONDS, 30),
 
-    // Auto-replying into a group answers every member's every message.
     allowGroups: bool(process.env.ALLOW_GROUPS, false),
-
-    // Stops two auto-repliers pointing at each other from running forever.
-    // Zero or less disables the limit.
     maxRepliesPerHour: num(process.env.MAX_REPLIES_PER_HOUR, 20),
   },
 
@@ -54,12 +50,9 @@ module.exports = {
     model: process.env.ASSISTANT_MODEL || 'llama3.1:8b',
     memoryWindow: num(process.env.ASSISTANT_MEMORY_WINDOW, 20),
 
-    // Where the persona comes from, tried in this order. See src/lib/prompt.js.
     systemPromptFile: process.env.SYSTEM_PROMPT_FILE || '',
     systemPrompt: process.env.SYSTEM_PROMPT || '',
 
-    // The self-disclosure notice. Wording is yours; always, first (once per
-    // conversation) or never controls how often it is attached.
     aiPrefix: process.env.AI_PREFIX || '[AI]',
     aiPrefixMode: oneOf(process.env.AI_PREFIX_MODE, ['always', 'first', 'never'], 'always'),
   },

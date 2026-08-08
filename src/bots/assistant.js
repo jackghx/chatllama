@@ -1,10 +1,4 @@
-/**
- * assistant: answers WhatsApp messages on behalf of the account owner.
- *
- * The persona is not in this file. It comes from prompts/assistant.md,
- * SYSTEM_PROMPT or SYSTEM_PROMPT_FILE, because tailoring the voice is the
- * point of running this rather than an off the shelf auto responder.
- */
+// Persona lives in prompts/assistant.md, SYSTEM_PROMPT or SYSTEM_PROMPT_FILE.
 const { assistant: cfg, webhook } = require('../config');
 const { generate } = require('../lib/ollama');
 const { ConversationStore } = require('../lib/memory');
@@ -16,33 +10,22 @@ const { text: systemPrompt, source: promptSource } = loadSystemPrompt();
 
 const memory = new ConversationStore(cfg.memoryWindow);
 
-/** Conversations that have already carried the notice, for prefix mode "first". */
-const disclosed = new Set();
-
-/**
- * The transcript label is fixed at "Assistant:" rather than reusing the
- * disclosure notice. They are separate things: one structures the prompt, the
- * other is shown to the person, and the notice can be switched off entirely.
- */
-const TRANSCRIPT_LABEL = 'Assistant';
+// Separate from AI_PREFIX, which is shown to the person and can be switched off.
+const LABEL = 'Assistant';
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/**
- * Remove any leading transcript label or notice the model produced itself.
- *
- * The notice is attached below, in code. If the model also emits one, the
- * reply goes out carrying it twice.
- */
-function stripLeadingMarkers(raw) {
-  const patterns = [new RegExp(`^${TRANSCRIPT_LABEL}\\s*:\\s*`, 'i')];
-  if (cfg.aiPrefix) patterns.push(new RegExp(`^${escapeRe(cfg.aiPrefix)}\\s*:?\\s*`));
+const MARKERS = [new RegExp(`^${LABEL}\\s*:\\s*`, 'i')];
+if (cfg.aiPrefix) MARKERS.push(new RegExp(`^${escapeRe(cfg.aiPrefix)}\\s*:?\\s*`));
 
+// Models often open with the label or the prefix, which would then appear twice.
+function stripMarkers(raw) {
   let out = raw.trim();
-  for (let changed = true; changed; ) {
+  let changed = true;
+  while (changed) {
     changed = false;
-    for (const pattern of patterns) {
-      const next = out.replace(pattern, '');
+    for (const marker of MARKERS) {
+      const next = out.replace(marker, '');
       if (next !== out) {
         out = next;
         changed = true;
@@ -52,51 +35,42 @@ function stripLeadingMarkers(raw) {
   return out.trim();
 }
 
-/**
- * Attach the self-disclosure notice.
- *
- * Applied here rather than asked for in the system prompt. There is a
- * precedent in this repo: the quiz bot asked the model to emit a fixed token
- * on every reply, the model dropped it often enough to corrupt the score, and
- * the fix was to stop depending on it. The same failure here is worse, because
- * the person on the other end cannot tell it happened.
- */
-function withNotice(conversationId, answer) {
+// Attached after generation. A model told to always emit a fixed string drops
+// it eventually, and here that failure is invisible to whoever reads the reply.
+function withNotice(answer, isFirstReply) {
   if (cfg.aiPrefixMode === 'never') return answer;
-  if (cfg.aiPrefixMode === 'first' && disclosed.has(conversationId)) return answer;
-
-  disclosed.add(conversationId);
+  if (cfg.aiPrefixMode === 'first' && !isFirstReply) return answer;
   return `${cfg.aiPrefix} ${answer}`;
 }
 
 async function handle(conversationId, text, ctx) {
   const history = memory.lines(conversationId);
-  const prompt = [systemPrompt, ...history, `User: ${text}`, `${TRANSCRIPT_LABEL}:`].join('\n');
+  const isFirstReply = history.length === 0;
+  const prompt = [systemPrompt, ...history, `User: ${text}`, `${LABEL}:`].join('\n');
 
   let raw;
   try {
     raw = await generate({
       model: cfg.model,
       prompt,
-      // Without stop sequences the model writes both sides of the
-      // conversation, inventing the user's next message and answering it.
-      stop: ['User:', '\nUser:', `\n${TRANSCRIPT_LABEL}:`],
+      // Without these the model writes the user's next message and answers it.
+      stop: ['User:', '\nUser:', `\n${LABEL}:`],
     });
   } catch (err) {
     console.error('[assistant] generation failed:', err.message);
-    return withNotice(conversationId, 'Something went wrong reaching the model. Try again in a moment.');
+    return withNotice('Something went wrong reaching the model. Try again shortly.', isFirstReply);
   }
 
-  const answer = stripLeadingMarkers(raw);
+  const answer = stripMarkers(raw);
   if (!answer) {
     console.error('[assistant] model returned an empty reply');
-    return withNotice(conversationId, 'I did not manage an answer there. Try asking again.');
+    return withNotice('I did not manage an answer there. Try asking again.', isFirstReply);
   }
 
   memory.push(conversationId, `User: ${text}`);
-  memory.push(conversationId, `${TRANSCRIPT_LABEL}: ${answer}`);
+  memory.push(conversationId, `${LABEL}: ${answer}`);
 
-  const reply = withNotice(conversationId, answer);
+  const reply = withNotice(answer, isFirstReply);
 
   if (!ctx.isSim || webhook.fireInSim) {
     notify({

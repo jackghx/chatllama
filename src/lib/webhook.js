@@ -13,14 +13,8 @@ async function post(payload) {
   }
 }
 
-/**
- * POST an event to the configured n8n webhook.
- *
- * Fire and forget, and deliberately not awaitable: handlers run inside the
- * serial queue, so awaiting this would hold up the reply to the person
- * waiting on their phone for as long as n8n took to answer, up to the
- * timeout. Failures are logged and otherwise ignored.
- */
+// Deliberately not awaitable. Handlers run inside the serial queue, so waiting
+// on n8n would delay the reply to the person waiting on their phone.
 function notify(payload) {
   if (!webhook.url) return;
   post(payload);

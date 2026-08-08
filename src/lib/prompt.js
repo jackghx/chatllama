@@ -4,24 +4,11 @@ const { assistant } = require('../config');
 
 const DEFAULT_FILE = path.join(__dirname, '..', '..', 'prompts', 'assistant.md');
 
-/** Editor notes in the prompt file are not instructions for the model. */
 const stripComments = (text) => text.replace(/<!--[\s\S]*?-->/g, '');
 
-/**
- * Resolve the system prompt, in priority order:
- *
- *   1. SYSTEM_PROMPT_FILE, a path to a text or markdown file
- *   2. SYSTEM_PROMPT, an inline string
- *   3. the bundled default at prompts/assistant.md
- *
- * Returns { text, source }. The source is logged at startup: editing the wrong
- * one and seeing no change in behaviour is otherwise silent, and the operator
- * has no way to tell which of the three won.
- *
- * An unreadable SYSTEM_PROMPT_FILE falls through to the next source rather than
- * throwing. This runs unattended under pm2, where a crash on boot means missed
- * messages, and the startup line still reports what was actually loaded.
- */
+// SYSTEM_PROMPT_FILE, then SYSTEM_PROMPT, then the bundled default. An
+// unreadable file falls through rather than throwing: this runs unattended
+// under pm2, where exiting on boot means missed messages.
 function loadSystemPrompt() {
   if (assistant.systemPromptFile) {
     const file = path.resolve(assistant.systemPromptFile);
@@ -38,8 +25,10 @@ function loadSystemPrompt() {
     return { text: assistant.systemPrompt.trim(), source: 'SYSTEM_PROMPT' };
   }
 
-  const text = stripComments(fs.readFileSync(DEFAULT_FILE, 'utf8')).trim();
-  return { text, source: `default ${DEFAULT_FILE}` };
+  return {
+    text: stripComments(fs.readFileSync(DEFAULT_FILE, 'utf8')).trim(),
+    source: `default ${DEFAULT_FILE}`,
+  };
 }
 
 module.exports = { loadSystemPrompt };

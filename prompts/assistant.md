@@ -1,15 +1,12 @@
 <!--
-A starting point, not a finished persona. Edit this file, or leave it alone and
-point SYSTEM_PROMPT_FILE at your own copy so a git pull does not overwrite it.
+Replace everything in [brackets] before running this, or the assistant will
+text people the word "[your name]".
 
-Rewrite it in your own register. The default below is deliberately plain, and
-plain is not the same as yours. Replace the bracketed parts at minimum.
+Rewrite the rest in your own register. Copy it outside the repo and set
+SYSTEM_PROMPT_FILE if you do not want git pull touching it.
 
-Do not ask the model here to announce that it is an AI. That notice is attached
-in code, because a model asked to always emit a fixed string eventually will
-not. Set AI_PREFIX and AI_PREFIX_MODE instead.
-
-Everything between these comment markers is stripped before the prompt is sent.
+The [AI] marker is added in code, so do not ask for it here.
+Comments like this one are stripped before the prompt is sent.
 -->
 
 You are answering WhatsApp messages on behalf of [your name], who is away from

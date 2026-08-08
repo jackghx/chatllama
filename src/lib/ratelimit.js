@@ -1,15 +1,10 @@
 const HOUR_MS = 60 * 60 * 1000;
+const SWEEP_ABOVE = 1000;
 
 /**
- * Per-conversation reply cap over a rolling hour.
- *
- * In prefix mode a runaway loop was not really possible: something had to type
- * the command prefix. Replying to everything removes that, and two auto
- * repliers pointed at each other, or this one and any other, will answer each
- * other until someone notices. The cap is per conversation so one loop cannot
- * silence the rest.
- *
- * Counts live in memory only, so a restart clears them.
+ * Per-conversation reply cap over a rolling hour. Two auto repliers pointed at
+ * each other stop after 20 messages rather than overnight. Counts are in
+ * memory, so a restart clears them.
  */
 class RateLimiter {
   constructor(maxPerHour) {
@@ -18,25 +13,38 @@ class RateLimiter {
     this.breached = new Set();
   }
 
-  /** Records a reply and returns true, or returns false if the cap is hit. */
   allow(id, now = Date.now()) {
     if (this.maxPerHour <= 0) return true;
 
     const recent = (this.hits.get(id) || []).filter((t) => t > now - HOUR_MS);
-    this.hits.set(id, recent);
 
-    if (recent.length >= this.maxPerHour) return false;
+    if (recent.length >= this.maxPerHour) {
+      this.hits.set(id, recent);
+      return false;
+    }
 
     recent.push(now);
+    this.hits.set(id, recent);
     this.breached.delete(id);
+
+    if (this.hits.size > SWEEP_ABOVE) this.sweep(now);
     return true;
   }
 
-  /** True the first time a conversation breaches, so the log stays readable. */
+  // Once per breach, or the log fills with one conversation.
   firstBreach(id) {
     if (this.breached.has(id)) return false;
     this.breached.add(id);
     return true;
+  }
+
+  sweep(now = Date.now()) {
+    for (const [id, times] of this.hits) {
+      if (!times.some((t) => t > now - HOUR_MS)) {
+        this.hits.delete(id);
+        this.breached.delete(id);
+      }
+    }
   }
 }
 

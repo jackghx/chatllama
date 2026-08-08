@@ -1,11 +1,5 @@
-/**
- * Runs async tasks strictly one at a time.
- *
- * Without this, five messages arriving in quick succession fire five
- * concurrent Ollama requests. They all read the conversation memory
- * before any of them writes back to it, so context is corrupted, and
- * CPU inference on an 8B model does not cope well with the parallelism.
- */
+// Five messages in five seconds would otherwise be five concurrent Ollama
+// requests, all reading conversation memory before any of them writes back.
 class SerialQueue {
   constructor(label = 'queue') {
     this.label = label;
