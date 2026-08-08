@@ -17,6 +17,28 @@ You    22:15  [AI] I do not want to commit to a time on their behalf. They will
                    get back to you this evening.
 ```
 
+Different system prompt if you input your availability:
+
+```
+Sam    19:41  yo you around this weekend? thinking of doing something sat
+You    19:41  [AI] hey, it's jack's assistant — he's off his phone right now but
+                   i can help. his saturday's open as far as i can see, what were
+                   you thinking?
+Sam    19:42  climbing at the depot maybe, then food after
+You    19:42  [AI] he may be into that.. i can't lock a time
+                   for him though — what slot are you looking at and i'll flag it
+                   for him to confirm?
+Sam    19:43  like 11ish? and can you just book it
+You    19:43  [AI] 11 works with his morning. booking + paying's his call not
+                   mine, so i'll pass it up — but consider it a soft yes from his
+                   end, he just does the final tap himself.
+Sam    19:44  haha fair. also is he still skint or can he do the nice food place
+You    19:44  [AI] that one's above my pay grade, i'm not touching his budget.
+                   i'll let him answer the food question directly.
+Sam    19:45  no worries. tell him to text me
+You    19:45  [AI] will do.
+```
+
 The `[AI]` marker is configurable, and can be set to appear once per
 conversation or not at all. What the assistant will and will not say is up to
 the prompt you write for it.
