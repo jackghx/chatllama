@@ -1,0 +1,29 @@
+# Secrets and config
+.env
+.env.*
+!.env.example
+
+# WhatsApp session data. These files are live credentials for the linked
+# account. Committing them lets anyone who clones the repo send messages
+# as you. Never remove this entry.
+.wwebjs_auth/
+.wwebjs_cache/
+sessions/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+package-lock.json.bak
+
+# pm2
+.pm2/
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Snapshots of the repo itself, which go stale the moment they are made
+*.zip

@@ -1,0 +1,22 @@
+{
+  "name": "chatllama",
+  "version": "2.0.0",
+  "description": "Self-hosted WhatsApp auto-reply assistant backed by a local Ollama instance, with optional n8n webhook logging.",
+  "main": "src/bots/assistant.js",
+  "scripts": {
+    "test": "node test/harness.js",
+    "assistant": "node src/bots/assistant.js",
+    "assistant:sim": "node src/bots/assistant.js --sim"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.23.0"
+  },
+  "license": "MIT",
+  "private": false
+}
