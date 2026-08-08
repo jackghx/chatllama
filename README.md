@@ -386,6 +386,11 @@ reboot without anyone logging in. Check with `pm2 list` and `pm2 logs assistant`
 Run one instance per WhatsApp account. Two pointed at the same account both
 answer every message.
 
+For a container or a headless server, see
+[docs/deploy-lxc.md](docs/deploy-lxc.md). It covers what runs where, the
+Chromium libraries a minimal Debian does not have, and the handful of things
+that fail with no useful error message.
+
 ## Notifications via n8n
 
 Optional, and off until `N8N_WEBHOOK_URL` is set. The assistant POSTs JSON to an
