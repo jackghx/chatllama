@@ -622,15 +622,22 @@ async function main() {
       assert.ok(scenarios.length >= 5, `found ${scenarios.length}`);
     });
 
+    let templates = 0;
     for (const name of scenarios) {
       const text = strip(path.join(dir, 'scenarios', name));
       // A file that is all comment strips to nothing, and loadSystemPrompt would
       // fall through to the default without saying why.
       check(`${name} survives comment stripping`, () => assert.ok(text.length > 100, name));
-      check(`${name} keeps its placeholders for the reader to fill in`, () =>
-        assert.ok(/\[[^\]]+\]/.test(text), name)
-      );
+
+      // Personas name nobody and need nothing filled in. Templates do, and a
+      // real name in one means somebody's details were committed by accident.
+      check(`${name} names no one`, () => assert.ok(!/\bJack\b/.test(text), name));
+      if (/\[[^\]]+\]/.test(text)) templates += 1;
     }
+
+    check('the templates still carry placeholders to fill in', () =>
+      assert.ok(templates >= 5, `only ${templates} of ${scenarios.length}`)
+    );
 
     // The live one is filled in, so an unreplaced placeholder here is the
     // failure the README warns about: texting people the words "[your name]".
