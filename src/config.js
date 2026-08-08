@@ -5,6 +5,10 @@ const bool = (v, fallback = false) => {
   return ['1', 'true', 'yes', 'on'].includes(String(v).toLowerCase());
 };
 
+// Three states, unlike bool. Unset means the field is left off the request
+// entirely, which is what a model with no thinking capability expects.
+const optBool = (v) => (v === undefined || String(v).trim() === '' ? null : bool(v));
+
 // Number('') is 0, so an empty variable has to be caught before coercion.
 const num = (v, fallback) => {
   if (v === undefined || String(v).trim() === '') return fallback;
@@ -27,6 +31,7 @@ module.exports = {
   ollama: {
     host: (process.env.OLLAMA_HOST || 'http://127.0.0.1:11434').replace(/\/+$/, ''),
     timeoutMs: num(process.env.OLLAMA_TIMEOUT_MS, 120000),
+    think: optBool(process.env.OLLAMA_THINK),
   },
 
   access: {
@@ -39,6 +44,18 @@ module.exports = {
 
     allowGroups: bool(process.env.ALLOW_GROUPS, false),
     maxRepliesPerHour: num(process.env.MAX_REPLIES_PER_HOUR, 20),
+
+    // How many times a reply may be thrown away and written again because the
+    // sender added something. Zero answers each message separately.
+    maxInterrupts: num(process.env.MAX_INTERRUPTS, 3),
+
+    // Sent once when a conversation hits the cap, so the silence that follows is
+    // explained rather than mysterious. An empty string sends nothing.
+    rateLimitNotice:
+      process.env.RATE_LIMIT_NOTICE === undefined
+        ? 'That is as many automatic replies as this number sends in an hour. ' +
+          'Your messages are still coming through and will be read.'
+        : process.env.RATE_LIMIT_NOTICE,
   },
 
   webhook: {
