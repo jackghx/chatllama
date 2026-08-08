@@ -37,6 +37,11 @@ You    19:44  [AI] that one's above my pay grade, i'm not touching his budget.
                    i'll let him answer the food question directly.
 Sam    19:45  no worries. tell him to text me
 You    19:45  [AI] will do.
+
+
+n8n's summary: climbing sat ~11 at the depot with sam, food after. told sam soft yes on climbing.
+waiting on you: confirm+book the 11am slot, and the food question (depot
+cafe vs the nice place — sam asked about budget, i didn't answer).
 ```
 
 The `[AI]` marker is configurable, and can be set to appear once per
@@ -69,7 +74,7 @@ which for this is no bad thing. Time it yourself in step 5 before deciding.
 ### 2. Install
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/jackghx/chatllama
 cd ChatLlama
 npm install
 cp .env.example .env
