@@ -110,6 +110,7 @@ A healthy start looks like this:
 [prompt] loaded from SYSTEM_PROMPT_FILE /home/you/persona.md
 [notice] "[AI]", mode always
 [webhook] logging off, N8N_WEBHOOK_URL is empty
+[digest] every 10 quiet minutes, or 15 exchanges
 [ollama] reachable. models: llama3.1:8b
 [access] ALLOWED_CONTACTS is empty and REPLY_MODE is always, so every message
          from anyone who has this number, including people not in your
@@ -237,6 +238,8 @@ with comments.
 | `MAX_REPLIES_PER_HOUR` | Per-conversation cap, default 20, zero disables |
 | `IGNORE_OLDER_THAN_SECONDS` | Drops the backlog replayed on connect |
 | `N8N_WEBHOOK_URL` | Optional, empty disables webhook logging |
+| `SUMMARY_IDLE_MINUTES` | Silence before a conversation is summarised, zero disables |
+| `SUMMARY_MAX_MESSAGES` | Summarise anyway at this many exchanges, default 15 |
 
 ## Keeping it running
 
@@ -255,11 +258,20 @@ answer every message.
 
 ## Logging to Discord
 
-Optional. The assistant can POST each exchange to an [n8n](https://n8n.io)
-webhook, which is a convenient way to watch what it has been saying without
-picking up your phone.
+Optional. The assistant can POST to an [n8n](https://n8n.io) webhook, which is a
+convenient way to watch what it has been saying without picking up your phone.
 
-See [docs/n8n-discord.md](docs/n8n-discord.md) for the payload shape and a
+It sends two kinds of event. `ai_message` fires on every exchange and is the
+full log. `conversation_summary` fires once, after a conversation has been
+quiet for `SUMMARY_IDLE_MINUTES`, and carries a short briefing written by the
+same model: what the person wanted, what the assistant committed to, and
+anything still waiting on you.
+
+The second is the one worth putting in front of yourself. A busy Saturday is
+one notification rather than twenty, and it names the decisions the assistant
+would not make on your behalf. Route `ai_message` somewhere quiet, or drop it.
+
+See [docs/n8n-discord.md](docs/n8n-discord.md) for both payload shapes and a
 working Discord embed setup.
 
 This forwards other people's messages into a channel. Tell them, or do not run
@@ -292,6 +304,12 @@ will be a `[limit]` line in the log. Raise `MAX_REPLIES_PER_HOUR`.
 or mistyped `N8N_WEBHOOK_URL` is skipped silently by design, and that line is
 the only signal.
 
+**Messages arrive but summaries never do.** Summaries wait for silence, so a
+conversation still in progress has not produced one yet. Check the `[digest]`
+line at startup, and look for `[digest] <id>: n exchange(s)` in the log when a
+conversation ends. Summaries are also skipped entirely when there is no webhook
+URL, since there would be nowhere to send them.
+
 **It asks for the QR code again.** The session in `.wwebjs_auth/` was removed,
 or `clientId` in `src/bots/assistant.js` changed. Scan once more.
 
@@ -310,8 +328,8 @@ and qrcode-terminal, so it needs no WhatsApp session, no Ollama and no
 dev dependency.
 
 It covers the filters, both reply modes, prompt source priority, the marker in
-all three modes, per-conversation memory, and the webhook when n8n accepts a
-connection and never answers.
+all three modes, per-conversation memory, the summary debounce, and the webhook
+when n8n accepts a connection and never answers.
 
 `HARNESS_REPO=/path/to/other/checkout npm test` runs the same checks against a
 different copy of the repo, which is how you tell a suite that asserts something

@@ -18,6 +18,8 @@ module.exports = {
       max_restarts: 10,
       restart_delay: 5000,
       max_memory_restart: '500M',
+      // Default is 1600ms, which cuts the shutdown summary flush short.
+      kill_timeout: 15000,
       out_file: 'logs/assistant-out.log',
       error_file: 'logs/assistant-error.log',
       time: true,

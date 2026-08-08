@@ -2,7 +2,9 @@ const fs = require('fs');
 const path = require('path');
 const { assistant } = require('../config');
 
-const DEFAULT_FILE = path.join(__dirname, '..', '..', 'prompts', 'assistant.md');
+const PROMPTS = path.join(__dirname, '..', '..', 'prompts');
+const DEFAULT_FILE = path.join(PROMPTS, 'assistant.md');
+const SUMMARY_FILE = path.join(PROMPTS, 'summary.md');
 
 const stripComments = (text) => text.replace(/<!--[\s\S]*?-->/g, '');
 
@@ -31,4 +33,10 @@ function loadSystemPrompt() {
   };
 }
 
-module.exports = { loadSystemPrompt };
+// No environment override. This one shapes a machine-readable briefing rather
+// than a persona, so it is edited in place on the rare occasion it needs to be.
+function loadSummaryPrompt() {
+  return stripComments(fs.readFileSync(SUMMARY_FILE, 'utf8')).trim();
+}
+
+module.exports = { loadSystemPrompt, loadSummaryPrompt };

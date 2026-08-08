@@ -1,10 +1,15 @@
 # Logging to Discord via n8n
 
-The assistant POSTs a JSON body to `N8N_WEBHOOK_URL` for each message it
-answers. If the variable is empty the webhook is skipped entirely, so this is
-optional. Whether it is on is logged at startup.
+The assistant POSTs JSON to `N8N_WEBHOOK_URL`. If the variable is empty the
+webhook is skipped entirely, so this is optional. Whether it is on is logged at
+startup.
 
-## Payload
+Two events arrive on the same URL, told apart by the `event` field. Branch on it
+with a Switch node.
+
+## ai_message
+
+One per exchange, the full log.
 
 ```json
 {
@@ -21,15 +26,48 @@ optional. Whether it is on is logged at startup.
 one was attached. In `first` mode most lines in a conversation will not carry
 it.
 
-The POST is fire and forget. Handlers run inside a serial queue, so waiting on
-n8n would hold up the reply to the person who is waiting on their phone.
+## conversation_summary
+
+One per conversation, written when it goes quiet. This is the one to notify
+yourself with.
+
+```json
+{
+  "event": "conversation_summary",
+  "bot": "assistant",
+  "from": "1234567890@lid",
+  "reason": "idle",
+  "messages": 5,
+  "summary": "Sam asked about Saturday and settled on climbing at the Depot around 11 with food after. The assistant gave a soft yes but would not book or pay. Sam also asked whether you can afford the nicer food place, which was left for you. He wants a text.",
+  "transcript": ["User: yo you around this weekend?", "Assistant: ..."],
+  "timestamp": "2026-08-08T20:21:44.117Z"
+}
+```
+
+`reason` is `idle` when the conversation went quiet, `cap` when it hit
+`SUMMARY_MAX_MESSAGES` without pausing, and `shutdown` when the process was
+stopped with a summary still pending.
+
+`summary` is empty if the model could not be reached. `transcript` still holds
+the exchange, so the notification is worth sending either way.
+
+## Timing
+
+Every reply resets that conversation's timer. The summary fires only once the
+other person has stopped writing for `SUMMARY_IDLE_MINUTES`, so a back and
+forth produces one notification at the end rather than one per message.
+
+Both POSTs are fire and forget. Handlers run inside a serial queue, so waiting
+on n8n would hold up the reply to the person on their phone.
 
 ## n8n workflow
 
 1. **Webhook** node, method `POST`. Use the `/webhook-test/` URL while building,
    which only listens while the editor is open and "Listen for test event" is
    active. Switch to the `/webhook/` URL and activate the workflow once it works.
-2. **Discord** node, connection type `Webhook`, operation `Send a Message`.
+2. **Switch** node on `{{ $json.body.event }}`, one output per event name. Skip
+   this if you only want summaries, and use an IF node instead.
+3. **Discord** node, connection type `Webhook`, operation `Send a Message`.
 
 ## Building the embed
 
@@ -55,6 +93,22 @@ Then add fields under the embed's own **Fields** section:
 Note the `body.` prefix. n8n nests the incoming webhook payload under `body`,
 so `{{ $json.userMessage }}` resolves to nothing.
 
+For the summary branch, a second Discord node on the other output of the Switch:
+
+| Field | Value |
+| --- | --- |
+| Title | `Conversation ended` |
+| Description | `{{ $json.body.summary }}` |
+| Color | `#5865F2` |
+
+| Name | Value | Inline |
+| --- | --- | --- |
+| With | `{{ $json.body.from }}` | true |
+| Messages | `{{ $json.body.messages }}` | true |
+
+If you want the raw exchange underneath, `{{ $json.body.transcript.join("\n") }}`
+in a field value works, but mind the 1024 character limit below.
+
 ## If you would rather use an HTTP Request node
 
 Point it at the Discord webhook URL, method `POST`, body type JSON:
@@ -79,6 +133,27 @@ Point it at the Discord webhook URL, method `POST`, body type JSON:
 
 Discord truncates embed field values at 1024 characters. Long model replies will
 be cut off, so add a Set or Code node to trim them first if that matters.
+
+## A "what did I miss" command
+
+Once summaries are landing, asking for them on demand is a second n8n workflow
+and no change to the assistant.
+
+1. On the summary branch above, add a node that stores the row rather than only
+   posting it. n8n's own data store, a Google Sheet and a SQLite table all work.
+   Keep `timestamp`, `from`, `messages` and `summary`.
+2. New workflow, triggered by a Discord slash command such as `/missed`. n8n's
+   Discord trigger or an interactions webhook both reach it.
+3. Read the rows from the last 24 hours.
+4. HTTP Request node to `http://<your ollama host>:11434/api/generate`, method
+   POST, body `{"model": "llama3.1:8b", "prompt": "...", "stream": false}`,
+   with the rows pasted into the prompt and an instruction to merge them into
+   one briefing. The answer is in `response`.
+5. Discord node to reply.
+
+Make `/missed` mean a fixed window rather than "since I last asked". Tracking a
+read marker means storing state and keeping it correct, and the fixed window
+needs neither.
 
 ## Testing without a second person
 

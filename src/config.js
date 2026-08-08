@@ -46,6 +46,11 @@ module.exports = {
     fireInSim: bool(process.env.WEBHOOK_IN_SIM, false),
   },
 
+  summary: {
+    idleMinutes: num(process.env.SUMMARY_IDLE_MINUTES, 10),
+    maxMessages: num(process.env.SUMMARY_MAX_MESSAGES, 15),
+  },
+
   assistant: {
     model: process.env.ASSISTANT_MODEL || 'llama3.1:8b',
     memoryWindow: num(process.env.ASSISTANT_MEMORY_WINDOW, 20),
