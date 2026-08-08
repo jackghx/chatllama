@@ -103,7 +103,7 @@ their phone at the moment.
 If you leave those, the assistant will text your friends the words
 `[your name]`. Replace every bracketed part.
 
-Better, copy it somewhere outside the repo so a `git pull` cannot overwrite your
+Optionally, copy it somewhere outside the repo so a `git pull` cannot overwrite your
 wording, and point at it:
 
 ```
