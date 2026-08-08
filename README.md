@@ -123,12 +123,12 @@ And some that are only for people who are in on it:
 | `commentator.md` | Calls the conversation like a live match. |
 
 Set `ALLOWED_CONTACTS` before running any of those, so they only reach people
-who will find them funny. They keep the same refusals as the serious ones
-underneath the voice: no times, no plans, no money, and nothing invented about
-where you are.
+who will find them funny. They keep the same refusals underneath the voice: no
+times, no plans, no money, and nothing invented about where you are.
 
-Every file contains `[bracketed]` placeholders. Replace all of them, or the
-assistant will text people the word `[your name]`.
+The personas name nobody and have nothing to fill in, `as-you.md` aside. The
+serious templates all contain `[bracketed]` placeholders, and you have to
+replace every one or the assistant will text people the word `[your name]`.
 
 Point at your choice, and copy it outside the repo first if you do not want a
 `git pull` touching your wording:
