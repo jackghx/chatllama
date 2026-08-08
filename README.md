@@ -275,6 +275,7 @@ with comments.
 | `MAX_REPLIES_PER_HOUR` | Per-conversation cap, default 20, zero disables |
 | `IGNORE_OLDER_THAN_SECONDS` | Drops the backlog replayed on connect |
 | `N8N_WEBHOOK_URL` | Optional, empty disables webhook logging |
+| `WEBHOOK_IN_SIM` | Fire the webhook from terminal simulation too, default false |
 | `SUMMARY_IDLE_MINUTES` | Silence before a conversation is summarised, zero disables |
 | `SUMMARY_MAX_MESSAGES` | Summarise anyway at this many exchanges, default 15 |
 
@@ -293,26 +294,49 @@ reboot without anyone logging in. Check with `pm2 list` and `pm2 logs assistant`
 Run one instance per WhatsApp account. Two pointed at the same account both
 answer every message.
 
-## Logging to Discord
+## Notifications via n8n
 
-Optional. The assistant can POST to an [n8n](https://n8n.io) webhook, which is a
-convenient way to watch what it has been saying without picking up your phone.
+Optional, and off until `N8N_WEBHOOK_URL` is set. The assistant POSTs JSON to an
+[n8n](https://n8n.io) webhook, which is how you find out what was said in your
+name without picking up your phone. n8n self-hosts, so this does not have to
+put anything in someone else's cloud.
 
-It sends two kinds of event. `ai_message` fires on every exchange and is the
-full log. `conversation_summary` fires once, after a conversation has been
-quiet for `SUMMARY_IDLE_MINUTES`, and carries a short briefing written by the
-same model: what the person wanted, what the assistant committed to, and
-anything still waiting on you.
+It sends two kinds of event, told apart by the `event` field on one URL:
 
-The second is the one worth putting in front of yourself. A busy Saturday is
-one notification rather than twenty, and it names the decisions the assistant
-would not make on your behalf. Route `ai_message` somewhere quiet, or drop it.
+| Event | When | Carries |
+| --- | --- | --- |
+| `ai_message` | Every exchange | The message in, the reply as sent |
+| `conversation_summary` | Once, when the conversation goes quiet | A briefing, the exchange count, the transcript |
 
-See [docs/n8n-discord.md](docs/n8n-discord.md) for both payload shapes and a
-working Discord embed setup.
+The summary is the one worth notifying yourself on. A busy Saturday becomes one
+message rather than twenty, and the briefing names what the assistant would not
+decide for you: the invitation it deferred, the time it would not agree, the
+question about money it left alone. Route `ai_message` somewhere quiet, or drop
+it on the floor.
 
-This forwards other people's messages into a channel. Tell them, or do not run
-it.
+Summaries wait for silence. Every reply resets that conversation's timer, and
+`SUMMARY_IDLE_MINUTES` of quiet closes it. `SUMMARY_MAX_MESSAGES` forces one for
+a conversation that never pauses, and stopping the process flushes whatever was
+still waiting. The `reason` field on the event says which of the three it was.
+
+### Asking what you missed
+
+Once summaries are landing you can have a Discord slash command answer "what did
+I miss" from them: store each summary as it arrives, and on `/missed` feed the
+last day of rows back through Ollama as one briefing. That is a second n8n
+workflow and no change to this repo, and the steps are in
+[docs/n8n-discord.md](docs/n8n-discord.md).
+
+The history lives wherever that workflow stores it, not here. Both POSTs are
+fire and forget with no retry and nothing written locally, so a summary that
+fires while n8n is down is gone, and `/missed` cannot know it is missing. Worth
+knowing before you rely on it as a record rather than a notification.
+
+### Before you turn it on
+
+This forwards other people's messages into a channel. They are writing to what
+they believe is your phone, and a channel is a good deal less private than a one
+to one chat. Tell them, or do not run it.
 
 ## Troubleshooting
 
@@ -365,14 +389,14 @@ and qrcode-terminal, so it needs no WhatsApp session, no Ollama and no
 `npm install`. It exits non-zero on any failure. There is no test runner and no
 dev dependency.
 
-It covers the filters, both reply modes, prompt source priority, the marker in
-all three modes, per-conversation memory, the summary debounce, and the webhook
-when n8n accepts a connection and never answers.
+It covers the filters, both reply modes, contact ID capture, prompt source
+priority, the marker in all three modes, per-conversation memory, the summary
+debounce, and the webhook when n8n accepts a connection and never answers.
 
 `HARNESS_REPO=/path/to/other/checkout npm test` runs the same checks against a
 different copy of the repo, which is how you tell a suite that asserts something
-from one that only appears to. Run against the sources from before the fixes
-they cover, these failed 10 of 34 checks, all in the areas those fixes touched.
+from one that only appears to. Run against the commit before contact capture was
+added, these fail 7 of 112, all of them in the section covering it.
 
 ## Notes from building this
 

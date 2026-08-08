@@ -1,7 +1,7 @@
 {
   "name": "chatllama",
   "version": "2.0.0",
-  "description": "Self-hosted WhatsApp auto-reply assistant backed by a local Ollama instance, with optional n8n webhook logging.",
+  "description": "Answers WhatsApp on your behalf from a local Ollama model, and tells you what it said.",
   "main": "src/bots/assistant.js",
   "scripts": {
     "test": "node test/harness.js",

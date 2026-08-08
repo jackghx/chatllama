@@ -1,4 +1,4 @@
-# Logging to Discord via n8n
+# Discord notifications via n8n
 
 The assistant POSTs JSON to `N8N_WEBHOOK_URL`. If the variable is empty the
 webhook is skipped entirely, so this is optional. Whether it is on is logged at
