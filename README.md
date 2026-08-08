@@ -1,7 +1,6 @@
 # ChatLlama
 
-A self-hosted WhatsApp auto-reply assistant backed by a local
-[Ollama](https://ollama.com) instance.
+A self-hosted WhatsApp assistant that messages on your behalf, privately.
 
 It answers messages sent to your WhatsApp account while you are away from your
 phone. Everything runs on your own machine, so the messages never leave it. What
