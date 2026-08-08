@@ -89,6 +89,8 @@ const CONFIG_ENV = [
   'AI_PREFIX_MODE',
   'N8N_WEBHOOK_URL',
   'WEBHOOK_IN_SIM',
+  'SUMMARY_IDLE_MINUTES',
+  'SUMMARY_MAX_MESSAGES',
 ];
 
 /**
@@ -150,6 +152,7 @@ async function section(name, fn) {
 }
 
 const settle = () => new Promise((r) => setImmediate(r));
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Captures console output for checks on startup logging. */
 async function capturingLogs(fn) {
@@ -595,7 +598,11 @@ async function main() {
   });
 
   await section('webhook does not block the reply', async () => {
-    resetModules({ N8N_WEBHOOK_URL: 'http://stub-n8n/webhook/test', WEBHOOK_IN_SIM: 'true' });
+    resetModules({
+      N8N_WEBHOOK_URL: 'http://stub-n8n/webhook/test',
+      WEBHOOK_IN_SIM: 'true',
+      SUMMARY_IDLE_MINUTES: '0',
+    });
 
     let webhookCalled = null;
     axiosStub = makeAxios({
@@ -629,6 +636,171 @@ async function main() {
       assert.strictEqual(webhookCalled.botReply, '[AI] Lima.');
       assert.ok(webhookCalled.timestamp);
     });
+  });
+
+  await section('digest timing', async () => {
+    resetModules();
+    axiosStub = makeAxios();
+    const { Digest } = require(srcFile('lib', 'digest.js'));
+
+    const record = (into) => (id, state) => into.push({ id, ...state });
+
+    const burst = [];
+    const quiet = new Digest({ idleMs: 200, onFlush: record(burst) });
+    for (let i = 0; i < 3; i += 1) quiet.track('a', { from: 'a@lid' });
+    await settle();
+    check('nothing fires while the conversation is still going', () =>
+      assert.strictEqual(burst.length, 0)
+    );
+
+    await wait(500);
+    check('a burst produces one flush, not one per message', () =>
+      assert.strictEqual(burst.length, 1)
+    );
+    check('the flush counts the whole burst', () => assert.strictEqual(burst[0].messages, 3));
+    check('the flush carries the sender through', () =>
+      assert.strictEqual(burst[0].meta.from, 'a@lid')
+    );
+    check('idle is recorded as the reason', () => assert.strictEqual(burst[0].reason, 'idle'));
+
+    // The window has to restart on every message, or a long conversation is
+    // summarised halfway through and again at the end.
+    const reset = [];
+    const talking = new Digest({ idleMs: 300, onFlush: record(reset) });
+    talking.track('b');
+    await wait(80);
+    talking.track('b');
+    await wait(80);
+    talking.track('b');
+    check('a new message restarts the window', () => assert.strictEqual(reset.length, 0));
+    await wait(600);
+    check('the window closes once the talking stops', () =>
+      assert.strictEqual(reset.length, 1)
+    );
+    check('every message in the exchange is counted', () =>
+      assert.strictEqual(reset[0].messages, 3)
+    );
+
+    // Without this a conversation that never goes quiet never notifies.
+    const capped = [];
+    const ceiling = new Digest({ idleMs: 60000, maxMessages: 3, onFlush: record(capped) });
+    for (let i = 0; i < 3; i += 1) ceiling.track('c');
+    await settle();
+    check('the message ceiling fires without waiting for silence', () =>
+      assert.strictEqual(capped.length, 1)
+    );
+    check('the ceiling is recorded as the reason', () =>
+      assert.strictEqual(capped[0].reason, 'cap')
+    );
+
+    ceiling.track('c');
+    check('a fresh window opens after the ceiling fires', () =>
+      assert.strictEqual(ceiling.pending.get('c').messages, 1)
+    );
+    await ceiling.flushAll();
+    check('flushAll drains what was still waiting', () =>
+      assert.strictEqual(capped.length, 2)
+    );
+    check('shutdown is recorded as the reason', () =>
+      assert.strictEqual(capped[1].reason, 'shutdown')
+    );
+    check('nothing is left pending afterwards', () =>
+      assert.strictEqual(ceiling.pending.size, 0)
+    );
+
+    const never = [];
+    const disabled = new Digest({ idleMs: 0, onFlush: record(never) });
+    disabled.track('d');
+    await settle();
+    check('zero idle minutes disables tracking entirely', () =>
+      assert.strictEqual(disabled.pending.size, 0)
+    );
+
+    const logs = await capturingLogs(async () => {
+      const broken = new Digest({
+        idleMs: 60000,
+        onFlush: () => {
+          throw new Error('n8n is down');
+        },
+      });
+      broken.track('e');
+      await broken.flushAll();
+    });
+    check('a failing flush is logged rather than thrown', () =>
+      assert.ok(logs.some((l) => l.includes('[digest] flush failed')))
+    );
+  });
+
+  await section('conversation summary event', async () => {
+    resetModules({
+      N8N_WEBHOOK_URL: 'http://stub-n8n/webhook/test',
+      WEBHOOK_IN_SIM: 'true',
+      SUMMARY_IDLE_MINUTES: '0.004',
+      SUMMARY_MAX_MESSAGES: '15',
+    });
+
+    const sent = [];
+    axiosStub = makeAxios({
+      '/api/generate': async (body) => ({
+        data: {
+          response: body.prompt.includes('Briefing:')
+            ? 'Sam wants to climb on Saturday. The booking is still yours to make.'
+            : 'Sounds good.',
+        },
+      }),
+      'stub-n8n': async (body) => {
+        sent.push(body);
+        return { status: 200 };
+      },
+    });
+
+    require(srcFile('bots', 'assistant.js'));
+    const ctx = { isSim: true, from: null };
+
+    await capturedBot.handle('c1', 'you around saturday', ctx);
+    await capturedBot.handle('c1', 'climbing then food after', ctx);
+    await settle();
+
+    const of = (event) => sent.filter((s) => s.event === event);
+    check('every reply still fires its own message event', () =>
+      assert.strictEqual(of('ai_message').length, 2)
+    );
+    check('no summary lands while the conversation is live', () =>
+      assert.strictEqual(of('conversation_summary').length, 0)
+    );
+
+    await wait(500);
+    check('one summary covers the whole exchange', () =>
+      assert.strictEqual(of('conversation_summary').length, 1)
+    );
+
+    const summary = of('conversation_summary')[0];
+    check('the summary is the generated briefing', () =>
+      assert.ok(summary.summary.includes('booking'))
+    );
+    check('the transcript travels with it', () =>
+      assert.ok(summary.transcript.some((l) => l.includes('you around saturday')))
+    );
+    check('the exchange count travels with it', () =>
+      assert.strictEqual(summary.messages, 2)
+    );
+    check('the summary prompt is not the persona prompt', () => {
+      const briefing = axiosStub.posts().find((p) => p.body?.prompt?.includes('Briefing:'));
+      assert.ok(briefing.body.prompt.includes('Transcript:'));
+    });
+    check('the bot exposes a shutdown flush for the runner', () =>
+      assert.strictEqual(typeof capturedBot.shutdown, 'function')
+    );
+
+    const off = { ...ctx };
+    resetModules({ N8N_WEBHOOK_URL: '', SUMMARY_IDLE_MINUTES: '0.004' });
+    axiosStub = makeAxios(ollamaReplies('Sounds good.'));
+    require(srcFile('bots', 'assistant.js'));
+    await capturedBot.handle('c1', 'hello', off);
+    await wait(300);
+    check('no webhook URL means no summary generation is attempted', () =>
+      assert.strictEqual(axiosStub.posts().length, 1)
+    );
   });
 
   const failed = results.filter(([ok]) => !ok).length;

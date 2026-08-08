@@ -8,14 +8,44 @@ const { enabled: webhookEnabled } = require('./webhook');
 const { SerialQueue } = require('./queue');
 const { RateLimiter } = require('./ratelimit');
 
+// Long enough for a summary generation to finish. pm2 sends SIGKILL after its
+// kill_timeout, which ecosystem.config.js raises to sit above this.
+const SHUTDOWN_GRACE_MS = 10000;
+
+let shutdownInstalled = false;
+
 /**
  * Boots a bot against WhatsApp, or against the terminal with --sim.
  *
  * A bot is { name, clientId, startup: string[], handle(id, text, ctx) }
- * where ctx is { isSim, from }.
+ * where ctx is { isSim, from }. An optional shutdown() is awaited on SIGINT
+ * and SIGTERM, for work that would otherwise be lost on restart.
  */
 function run(bot) {
+  installShutdown(bot);
   return process.argv.includes('--sim') ? runSim(bot) : runWhatsApp(bot);
+}
+
+function installShutdown(bot) {
+  if (shutdownInstalled || typeof bot.shutdown !== 'function') return;
+  shutdownInstalled = true;
+
+  let closing = false;
+  const close = async (signal) => {
+    if (closing) return;
+    closing = true;
+    console.log(`[${bot.name}] ${signal}, finishing up`);
+
+    const grace = new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS).unref());
+    try {
+      await Promise.race([bot.shutdown(), grace]);
+    } catch (err) {
+      console.error(`[${bot.name}] shutdown failed:`, err.message);
+    }
+    process.exit(0);
+  };
+
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => close(signal));
 }
 
 async function preflight(bot) {
