@@ -1,10 +1,10 @@
 <!--
-The live prompt, filled in for the author rather than left as placeholders. If
-you have forked this, replace the name and the Friday arrangement with your own,
-or start from one of the templates in prompts/scenarios/ and point
-SYSTEM_PROMPT_FILE at the one you want.
+This is my own prompt, not a template, so it is filled in rather than left with
+placeholders in it. If you have forked this, swap the name and the Friday
+arrangement for yours, or start from one of the files in prompts/scenarios/ and
+point SYSTEM_PROMPT_FILE at it.
 
-Copy it somewhere outside the repo if you do not want a git pull touching your
+Keep your copy outside the repo if you do not want a git pull touching your
 wording.
 
 The [AI] marker is added in code, so do not ask for it here.
