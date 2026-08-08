@@ -9,6 +9,8 @@ the code.
 
 ## What it looks like
 
+Generic system prompt with no n8n workflow summary or availability:
+
 ```
 Sam    22:14  are you around tomorrow evening?
 You    22:14  [AI] Not at my phone right now, but I have passed that on.
