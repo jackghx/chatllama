@@ -17,7 +17,7 @@ You    22:15  [AI] I do not want to commit to a time on their behalf. They will
                    get back to you this evening.
 ```
 
-Different system prompt if you input your availability:
+Tailored system prompt for the AI & input your availability:
 
 ```
 Sam    19:41  yo you around this weekend? thinking of doing something sat
