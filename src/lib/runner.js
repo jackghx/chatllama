@@ -14,6 +14,10 @@ const SHUTDOWN_GRACE_MS = 10000;
 
 let shutdownInstalled = false;
 
+// Senders already printed in capture mode, so the log is a list to paste rather
+// than a running commentary.
+const captured = new Set();
+
 /**
  * Boots a bot against WhatsApp, or against the terminal with --sim.
  *
@@ -85,7 +89,15 @@ function stripPrefix(body, prefix) {
   return rest.trim();
 }
 
-function warnOnOpenAllowlist() {
+function reportAccess() {
+  if (access.captureIds) {
+    console.log(
+      '[capture] on, logging sender IDs and answering nobody. Turn it off ' +
+        'once ALLOWED_CONTACTS is filled in.'
+    );
+    return;
+  }
+
   if (access.allowedContacts.length) return;
 
   console.warn(
@@ -108,10 +120,19 @@ function accepts(msg, limiter) {
   if (chatId.endsWith('@broadcast')) return null;
   if (chatId.endsWith('@g.us') && !access.allowGroups) return null;
 
-  if (access.allowedContacts.length && !access.allowedContacts.includes(chatId)) {
-    if (access.logUnmatched) console.log('[access] unmatched sender:', chatId);
+  // Capture mode is how the @lid values for ALLOWED_CONTACTS are found. It runs
+  // before the allowlist so it sees everyone, and answers nobody, which keeps
+  // the account quiet while the list is being collected. Once per sender,
+  // because the same person messaging five times is the same one line.
+  if (access.captureIds) {
+    if (!captured.has(chatId)) {
+      captured.add(chatId);
+      console.log('[capture]', chatId);
+    }
     return null;
   }
+
+  if (access.allowedContacts.length && !access.allowedContacts.includes(chatId)) return null;
 
   // Images, stickers, voice notes and system events arrive with no body.
   // A captioned image carries its caption, and is answered on that.
@@ -158,7 +179,7 @@ function runWhatsApp(bot) {
   client.on('ready', async () => {
     console.log(`[${bot.name}] ready, reply mode: ${access.replyMode}`);
     await preflight(bot);
-    warnOnOpenAllowlist();
+    reportAccess();
   });
 
   client.on('message', (msg) => {

@@ -34,7 +34,7 @@ module.exports = {
     commandPrefix: process.env.COMMAND_PREFIX || '/ai',
 
     allowedContacts: list(process.env.ALLOWED_CONTACTS),
-    logUnmatched: bool(process.env.LOG_UNMATCHED, false),
+    captureIds: bool(process.env.CAPTURE_IDS, false),
     ignoreOlderThanSeconds: num(process.env.IGNORE_OLDER_THAN_SECONDS, 30),
 
     allowGroups: bool(process.env.ALLOW_GROUPS, false),

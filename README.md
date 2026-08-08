@@ -1,7 +1,6 @@
 # ChatLlama
 
-A self-hosted WhatsApp auto-reply assistant backed by a local
-[Ollama](https://ollama.com) instance.
+A self-hosted WhatsApp assistant that messages on your behalf, privately.
 
 It answers messages sent to your WhatsApp account while you are away from your
 phone. Everything runs on your own machine, so the messages never leave it. What
@@ -10,12 +9,41 @@ the code.
 
 ## What it looks like
 
+Generic system prompt with no n8n workflow summary or availability:
+
 ```
 Sam    22:14  are you around tomorrow evening?
 You    22:14  [AI] Not at my phone right now, but I have passed that on.
 Sam    22:15  no rush, just wondering about the thing at 7
 You    22:15  [AI] I do not want to commit to a time on their behalf. They will
                    get back to you this evening.
+```
+
+Tailored system prompt for the AI, including adding in your availability:
+
+```
+Sam    19:41  yo you around this weekend? thinking of doing something sat
+You    19:41  [AI] hey, it's jack's assistant — he's off his phone right now but
+                   i can help. his saturday's open as far as i can see, what were
+                   you thinking?
+Sam    19:42  climbing at the depot maybe, then food after
+You    19:42  [AI] he may be into that.. i can't lock a time
+                   for him though — what slot are you looking at and i'll flag it
+                   for him to confirm?
+Sam    19:43  like 11ish? and can you just book it
+You    19:43  [AI] 11 works with his morning. booking + paying's his call not
+                   mine, so i'll pass it up — but consider it a soft yes from his
+                   end, he just does the final tap himself.
+Sam    19:44  haha fair. also is he still skint or can he do the nice food place
+You    19:44  [AI] that one's above my pay grade, i'm not touching his budget.
+                   i'll let him answer the food question directly.
+Sam    19:45  no worries. tell him to text me
+You    19:45  [AI] will do.
+
+
+n8n's summary: climbing sat ~11 at the depot with sam, food after. told sam soft yes on climbing.
+waiting on you: confirm+book the 11am slot, and the food question (depot
+cafe vs the nice place — sam asked about budget, i didn't answer).
 ```
 
 The `[AI]` marker is configurable, and can be set to appear once per
@@ -48,7 +76,7 @@ which for this is no bad thing. Time it yourself in step 5 before deciding.
 ### 2. Install
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/jackghx/chatllama
 cd ChatLlama
 npm install
 cp .env.example .env
@@ -75,7 +103,7 @@ their phone at the moment.
 If you leave those, the assistant will text your friends the words
 `[your name]`. Replace every bracketed part.
 
-Better, copy it somewhere outside the repo so a `git pull` cannot overwrite your
+Optionally, copy it somewhere outside the repo so a `git pull` cannot overwrite your
 wording, and point at it:
 
 ```
@@ -92,8 +120,7 @@ npm run assistant:sim
 
 This runs the assistant against your terminal with no WhatsApp connection. Type
 messages as if you were the other person. Go back and edit the prompt until the
-replies sound like something you would be happy to have sent in your name. This
-costs nothing and is the whole point of running a local model.
+replies sound like something you would be happy to have sent in your name.
 
 ### 6. Connect WhatsApp
 
@@ -128,22 +155,30 @@ anyone who messages the number gets a reply.
 
 You cannot guess the IDs. Recent versions of whatsapp-web.js report senders as
 `<id>@lid`, and the LID does not match the phone number, so a hand written
-`447700900000@c.us` will simply never match. Get the real value from the bot:
+`447700900000@c.us` will simply never match. Get the real values from the bot:
 
 ```
-LOG_UNMATCHED=true
-ALLOWED_CONTACTS=placeholder@lid
+CAPTURE_IDS=true
 ```
 
-Restart, have the person message you, and read the log:
+Restart, have each person message you once, and read the log:
 
 ```
-[access] unmatched sender: 183765432109876@lid
+[capture] on, logging sender IDs and answering nobody. Turn it off once
+          ALLOWED_CONTACTS is filled in.
+[capture] 183765432109876@lid
+[capture] 274839201847362@lid
 ```
 
-Paste that into `ALLOWED_CONTACTS` as a comma separated list, set
-`LOG_UNMATCHED=false`, and restart. Setting a placeholder first means the bot
-stays quiet while you do this.
+Capture mode answers nobody, so nothing goes out while you collect the list.
+Each sender is logged once per run rather than once per message.
+
+Paste them in as a comma separated list, turn capture off, and restart:
+
+```
+ALLOWED_CONTACTS=183765432109876@lid,274839201847362@lid
+CAPTURE_IDS=false
+```
 
 ## Writing a good prompt
 
@@ -235,6 +270,7 @@ with comments.
 | `REPLY_MODE` | `always` or `prefix`, default `always` |
 | `COMMAND_PREFIX` | Prefix for `prefix` mode, default `/ai` |
 | `ALLOWED_CONTACTS` | Comma separated sender IDs, empty allows anyone |
+| `CAPTURE_IDS` | Logs sender IDs and answers nobody, for filling in the line above |
 | `ALLOW_GROUPS` | Reply in group chats, default false |
 | `MAX_REPLIES_PER_HOUR` | Per-conversation cap, default 20, zero disables |
 | `IGNORE_OLDER_THAN_SECONDS` | Drops the backlog replayed on connect |
@@ -281,7 +317,8 @@ it.
 ## Troubleshooting
 
 **It never replies to anyone.** Almost always `ALLOWED_CONTACTS` containing a
-guessed `@c.us` value. Follow step 7 above and use the ID the log prints.
+guessed `@c.us` value, or `CAPTURE_IDS` left on. Set `CAPTURE_IDS=true`, have
+the person write in, and compare the ID it prints against what you have.
 
 **It replies "Something went wrong reaching the model".** Ollama is not
 reachable. The startup log says so directly, above the ready line. Check

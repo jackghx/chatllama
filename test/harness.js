@@ -77,7 +77,7 @@ const CONFIG_ENV = [
   'REPLY_MODE',
   'COMMAND_PREFIX',
   'ALLOWED_CONTACTS',
-  'LOG_UNMATCHED',
+  'CAPTURE_IDS',
   'IGNORE_OLDER_THAN_SECONDS',
   'ALLOW_GROUPS',
   'MAX_REPLIES_PER_HOUR',
@@ -424,6 +424,69 @@ async function main() {
     check('reply is sent back to the sender', () =>
       assert.deepStrictEqual(client.sent, [{ to: 'good@lid', body: 'ok' }])
     );
+  });
+
+  await section('contact ID capture', async () => {
+    const lines = await capturingLogs(async () => {
+      const { seen, deliver } = bootRunner({ CAPTURE_IDS: 'true' });
+
+      await deliver({ from: '183765432109876@lid', body: 'hi' });
+      await deliver({ from: '183765432109876@lid', body: 'still here' });
+      await deliver({ from: '274839201847362@lid', body: 'hello' });
+
+      check('capture mode answers nobody', () => assert.strictEqual(seen.length, 0));
+    });
+
+    const captured = lines.filter((l) => l.startsWith('[capture]'));
+    check('the sender ID is logged in the form ALLOWED_CONTACTS takes', () =>
+      assert.ok(captured.includes('[capture] 183765432109876@lid'), JSON.stringify(lines))
+    );
+    check('a second sender is logged too', () =>
+      assert.ok(captured.includes('[capture] 274839201847362@lid'))
+    );
+    check('the same sender writing again is not logged twice', () =>
+      assert.strictEqual(captured.length, 2, JSON.stringify(captured))
+    );
+
+    // Without this, capture mode would be no help against an allowlist holding
+    // a guessed ID, which is the case it exists for.
+    const withList = await capturingLogs(async () => {
+      const { seen, deliver } = bootRunner({
+        CAPTURE_IDS: 'true',
+        ALLOWED_CONTACTS: 'guessed@c.us',
+      });
+      await deliver({ from: '183765432109876@lid', body: 'hi' });
+      check('an allowlist set does not stop the capture', () =>
+        assert.strictEqual(seen.length, 0)
+      );
+    });
+    check('a sender missing from the allowlist is still logged', () =>
+      assert.ok(withList.some((l) => l === '[capture] 183765432109876@lid'))
+    );
+
+    const groups = await capturingLogs(async () => {
+      const { deliver } = bootRunner({ CAPTURE_IDS: 'true' });
+      await deliver({ from: '1234@g.us', body: 'hi' });
+      await deliver({ from: '1234@broadcast', body: 'hi' });
+    });
+    check('groups and broadcasts are not captured unless ALLOW_GROUPS is on', () =>
+      assert.deepStrictEqual(groups.filter((l) => l.startsWith('[capture]')), [])
+    );
+
+    const startup = await capturingLogs(async () => {
+      const { client } = bootRunner({ CAPTURE_IDS: 'true' });
+      await client.emit('ready');
+    });
+    check('startup says capture mode is on', () =>
+      assert.ok(startup.some((l) => l.startsWith('[capture] on,')), JSON.stringify(startup))
+    );
+    check('capture mode does not also warn about the open allowlist', () =>
+      assert.ok(!startup.some((l) => l.includes('[access]')))
+    );
+
+    const { seen: after, deliver: deliverAfter } = bootRunner({ CAPTURE_IDS: 'false' });
+    await deliverAfter({ from: '183765432109876@lid', body: 'hi' });
+    check('turning capture off restores replies', () => assert.strictEqual(after.length, 1));
   });
 
   await section('startup logging', async () => {
