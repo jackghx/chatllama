@@ -74,6 +74,7 @@ Module._load = function (request, parent) {
 const CONFIG_ENV = [
   'OLLAMA_HOST',
   'OLLAMA_TIMEOUT_MS',
+  'OLLAMA_THINK',
   'REPLY_MODE',
   'COMMAND_PREFIX',
   'ALLOWED_CONTACTS',
@@ -81,6 +82,8 @@ const CONFIG_ENV = [
   'IGNORE_OLDER_THAN_SECONDS',
   'ALLOW_GROUPS',
   'MAX_REPLIES_PER_HOUR',
+  'MAX_INTERRUPTS',
+  'RATE_LIMIT_NOTICE',
   'ASSISTANT_MODEL',
   'ASSISTANT_MEMORY_WINDOW',
   'SYSTEM_PROMPT_FILE',
@@ -292,11 +295,30 @@ async function main() {
   });
 
   await section('reply cooldown', async () => {
-    const { seen, deliver, client } = bootRunner({ MAX_REPLIES_PER_HOUR: '3' });
+    const notice = 'automatic replies are paused for now';
+    const { seen, deliver, client } = bootRunner({
+      MAX_REPLIES_PER_HOUR: '3',
+      RATE_LIMIT_NOTICE: notice,
+    });
     for (let i = 0; i < 5; i += 1) await deliver({ body: `message ${i}` });
     check('replies stop at the cap', () => assert.strictEqual(seen.length, 3));
-    check('nothing further is sent to the chat', () =>
-      assert.strictEqual(client.sent.length, 3)
+    check('the sender is told why, once, rather than left in silence', () =>
+      assert.deepStrictEqual(
+        client.sent.filter((m) => m.body === notice),
+        [{ to: 'x@lid', body: notice }]
+      )
+    );
+    check('the notice comes after the replies, not in front of them', () =>
+      assert.strictEqual(client.sent[client.sent.length - 1].body, notice)
+    );
+    check('and nothing else is sent to the chat', () =>
+      assert.strictEqual(client.sent.length, 4)
+    );
+
+    const silent = bootRunner({ MAX_REPLIES_PER_HOUR: '2', RATE_LIMIT_NOTICE: '' });
+    for (let i = 0; i < 5; i += 1) await silent.deliver({ body: `m${i}` });
+    check('an empty RATE_LIMIT_NOTICE goes back to saying nothing', () =>
+      assert.strictEqual(silent.client.sent.length, 2)
     );
 
     const other = bootRunner({ MAX_REPLIES_PER_HOUR: '2' });
@@ -310,11 +332,19 @@ async function main() {
     );
 
     const logs = await capturingLogs(async () => {
-      const limited = bootRunner({ MAX_REPLIES_PER_HOUR: '1' });
+      const limited = bootRunner({ MAX_REPLIES_PER_HOUR: '1', RATE_LIMIT_NOTICE: '' });
       for (let i = 0; i < 4; i += 1) await limited.deliver({ body: `m${i}` });
     });
     check('the breach is logged once, not per message', () =>
       assert.strictEqual(logs.filter((l) => l.includes('[limit]')).length, 1)
+    );
+
+    // Silence is the point of the cap, so the explanation cannot be the thing
+    // that keeps a runaway conversation going.
+    const loop = bootRunner({ MAX_REPLIES_PER_HOUR: '1' });
+    for (let i = 0; i < 30; i += 1) await loop.deliver({ body: `m${i}` });
+    check('a sender who keeps writing is told once and no more', () =>
+      assert.strictEqual(loop.client.sent.length, 2)
     );
 
     const unlimited = bootRunner({ MAX_REPLIES_PER_HOUR: '0' });
@@ -423,6 +453,247 @@ async function main() {
     );
     check('reply is sent back to the sender', () =>
       assert.deepStrictEqual(client.sent, [{ to: 'good@lid', body: 'ok' }])
+    );
+  });
+
+  await section('a sender who corrects themselves', async () => {
+    /**
+     * axios stub that hangs until released, and rejects if the caller aborts
+     * first. Real generation is the only slow part of a reply, so holding it
+     * open is what puts the runner in the state a second message arrives into.
+     */
+    const heldAxios = () => {
+      const prompts = [];
+      let release = null;
+      return {
+        prompts,
+        calls: [],
+        posts: () => [],
+        finish: (text) => release && release(text),
+        async get() {
+          return { data: { models: [] } };
+        },
+        post(url, body, cfg) {
+          prompts.push(body.prompt);
+          return new Promise((resolve, reject) => {
+            release = (text) => resolve({ data: { response: text } });
+            if (cfg?.signal) {
+              cfg.signal.addEventListener('abort', () => reject(new Error('socket closed')));
+            }
+          });
+        },
+      };
+    };
+
+    const boot = (env = {}) => {
+      resetModules(env);
+      axiosStub = heldAxios();
+      require(srcFile('bots', 'assistant.js'));
+      const { run } = require(srcFile('lib', 'runner.js'));
+      const bot = capturedBot;
+      run(bot);
+      return { client: lastClient, ollama: axiosStub };
+    };
+
+    const send = async (client, body) => {
+      await client.emit('message', { from: 'sam@lid', timestamp: now(), body });
+      await settle();
+    };
+
+    const { client, ollama } = boot({ AI_PREFIX_MODE: 'never' });
+    await send(client, 'hey jack are you up on tuesday');
+    check('the first message starts generating straight away', () =>
+      assert.strictEqual(ollama.prompts.length, 1)
+    );
+
+    await send(client, 'oh wait actually thursday');
+    await settle();
+    check('the second message scraps that attempt and starts another', () =>
+      assert.strictEqual(ollama.prompts.length, 2)
+    );
+    check('nothing was sent for the message that was taken back', () =>
+      assert.deepStrictEqual(client.sent, [])
+    );
+    check('the new attempt carries both messages', () => {
+      const latest = ollama.prompts[1];
+      assert.ok(latest.includes('tuesday') && latest.includes('thursday'), latest);
+    });
+    check('and carries them as one turn, not two', () =>
+      assert.strictEqual((ollama.prompts[1].match(/^User:/gm) || []).length, 1)
+    );
+
+    ollama.finish('thursday is easier, i will pass it on');
+    await settle();
+    await settle();
+    check('one reply covers the whole thing', () =>
+      assert.deepStrictEqual(client.sent, [
+        { to: 'sam@lid', body: 'thursday is easier, i will pass it on' },
+      ])
+    );
+
+    // Two messages, one reply, so charging twice would empty the hourly
+    // allowance at half the rate the setting says. With one reply allowed, a
+    // charged correction is refused by the limiter and never amends anything.
+    const tight = boot({ MAX_REPLIES_PER_HOUR: '1', AI_PREFIX_MODE: 'never' });
+    await send(tight.client, 'are you up tuesday');
+    await send(tight.client, 'sorry, thursday');
+    await settle();
+    check('the correction did not cost a slot against the hourly cap', () =>
+      assert.strictEqual(tight.ollama.prompts.length, 2)
+    );
+
+    const capped = boot({ MAX_INTERRUPTS: '1', AI_PREFIX_MODE: 'never' });
+    await send(capped.client, 'one');
+    await send(capped.client, 'two');
+    await settle();
+    check('the cap allows the first correction', () =>
+      assert.strictEqual(capped.ollama.prompts.length, 2)
+    );
+    await send(capped.client, 'three');
+    await settle();
+    check('and stops restarting once it is reached', () =>
+      assert.strictEqual(capped.ollama.prompts.length, 2)
+    );
+
+    const off = boot({ MAX_INTERRUPTS: '0', AI_PREFIX_MODE: 'never' });
+    await send(off.client, 'first');
+    await send(off.client, 'second');
+    await settle();
+    check('MAX_INTERRUPTS=0 answers each message on its own, as before', () =>
+      assert.strictEqual(off.ollama.prompts.length, 1)
+    );
+    off.ollama.finish('one');
+    await settle();
+    await settle();
+    check('the queue then works through the second separately', () =>
+      assert.strictEqual(off.ollama.prompts.length, 2)
+    );
+
+    // The abort has to be told apart from an unreachable model, or every
+    // correction texts the person an error.
+    resetModules({});
+    axiosStub = heldAxios();
+    const { generate, Aborted } = require(srcFile('lib', 'ollama.js'));
+    // Bounded, because a build that ignores the signal leaves this pending for
+    // ever. Node then empties its event loop and exits 0 with no tally printed,
+    // which reads as a pass.
+    const settleOrGiveUp = (promise) =>
+      Promise.race([
+        promise.then(() => 'resolved with no error', (err) => err),
+        wait(250).then(() => 'still waiting, the signal was ignored'),
+      ]);
+
+    const controller = new AbortController();
+    const pending = settleOrGiveUp(
+      generate({ model: 'm', prompt: 'p', signal: controller.signal })
+    );
+    controller.abort();
+    const thrown = await pending;
+    check('an aborted generation throws Aborted, not a transport error', () =>
+      assert.ok(Aborted && thrown instanceof Aborted, String(thrown))
+    );
+
+    const dead = new AbortController();
+    dead.abort();
+    const sentBefore = axiosStub.prompts.length;
+    const early = await settleOrGiveUp(generate({ model: 'm', prompt: 'p', signal: dead.signal }));
+    check('a signal aborted before the call never reaches the model', () => {
+      assert.strictEqual(early?.name, 'Aborted', String(early));
+      assert.strictEqual(axiosStub.prompts.length, sentBefore);
+    });
+  });
+
+  await section('bundled prompts', async () => {
+    const dir = path.join(REPO, 'prompts');
+    const strip = (f) => fs.readFileSync(f, 'utf8').replace(/<!--[\s\S]*?-->/g, '').trim();
+
+    // Read defensively. A repo without the directory should fail this check and
+    // let the rest of the suite run, rather than throwing out of main().
+    let scenarios = [];
+    let listing = null;
+    try {
+      scenarios = fs.readdirSync(path.join(dir, 'scenarios')).filter((f) => f.endsWith('.md'));
+    } catch (err) {
+      listing = err.message;
+    }
+
+    check('there are scenarios to choose from', () => {
+      assert.ok(!listing, listing);
+      assert.ok(scenarios.length >= 5, `found ${scenarios.length}`);
+    });
+
+    for (const name of scenarios) {
+      const text = strip(path.join(dir, 'scenarios', name));
+      // A file that is all comment strips to nothing, and loadSystemPrompt would
+      // fall through to the default without saying why.
+      check(`${name} survives comment stripping`, () => assert.ok(text.length > 100, name));
+      check(`${name} keeps its placeholders for the reader to fill in`, () =>
+        assert.ok(/\[[^\]]+\]/.test(text), name)
+      );
+    }
+
+    // The live one is filled in, so an unreplaced placeholder here is the
+    // failure the README warns about: texting people the words "[your name]".
+    const live = strip(path.join(dir, 'assistant.md'));
+    check('assistant.md has no placeholders left in it', () => {
+      const found = live.match(/\[[^\]]+\]/g);
+      assert.ok(!found, JSON.stringify(found));
+    });
+    check('assistant.md is not empty after stripping', () => assert.ok(live.length > 100));
+    check('summary.md is not empty after stripping', () =>
+      assert.ok(strip(path.join(dir, 'summary.md')).length > 100)
+    );
+  });
+
+  await section('thinking models', async () => {
+    const generateWith = async (env, response) => {
+      resetModules(env);
+      axiosStub = makeAxios(ollamaReplies(response));
+      const { generate } = require(srcFile('lib', 'ollama.js'));
+      const text = await generate({ model: 'm', prompt: 'p' });
+      return { text, body: axiosStub.posts()[0].body };
+    };
+
+    const unset = await generateWith({}, 'hello');
+    check('OLLAMA_THINK unset leaves the field off the request entirely', () =>
+      assert.ok(!('think' in unset.body), JSON.stringify(unset.body))
+    );
+
+    const off = await generateWith({ OLLAMA_THINK: 'false' }, 'hello');
+    check('OLLAMA_THINK=false asks the model not to think', () =>
+      assert.strictEqual(off.body.think, false)
+    );
+
+    const on = await generateWith({ OLLAMA_THINK: 'true' }, 'hello');
+    check('OLLAMA_THINK=true asks for it', () => assert.strictEqual(on.body.think, true));
+
+    // Reasoning belongs in Ollama's own field. These are the shapes seen when a
+    // template puts it in the reply instead, which is what gets texted out.
+    for (const [label, raw, expected] of [
+      ['a closed block', '<think>they want a time</think>Not sure, I will ask.', 'Not sure, I will ask.'],
+      ['an unclosed block, cut off by a stop sequence', 'Sure.<think>although actually', 'Sure.'],
+      ['a template that primed the opening tag', 'weighing it up</think>Sounds good.', 'Sounds good.'],
+      ['more than one block', '<think>a</think>One.<think>b</think> Two.', 'One. Two.'],
+      ['mixed case tags', '<THINK>hmm</Think>Fine by me.', 'Fine by me.'],
+      ['nothing to strip', 'Just a reply.', 'Just a reply.'],
+    ]) {
+      const got = await generateWith({}, raw);
+      check(`reasoning stripped: ${label}`, () => assert.strictEqual(got.text, expected));
+    }
+
+    // Stripping can empty a reply that was nothing but reasoning, and an empty
+    // string is not something WhatsApp will send.
+    const logs = await capturingLogs(async () => {
+      resetModules({});
+      axiosStub = makeAxios(ollamaReplies('<think>no idea what they mean</think>'));
+      require(srcFile('bots', 'assistant.js'));
+      const reply = await capturedBot.handle('c1', 'you around?', { isSim: true, from: null });
+      check('a reply that was all reasoning falls back rather than going out empty', () =>
+        assert.ok(/did not manage an answer/.test(reply), JSON.stringify(reply))
+      );
+    });
+    check('and the empty reply is logged', () =>
+      assert.ok(logs.some((l) => l.includes('empty reply')), JSON.stringify(logs))
     );
   });
 

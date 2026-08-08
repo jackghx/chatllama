@@ -103,8 +103,12 @@ async function handle(conversationId, text, ctx) {
       prompt,
       // Without these the model writes the user's next message and answers it.
       stop: ['User:', '\nUser:', `\n${LABEL}:`],
+      signal: ctx.signal,
     });
   } catch (err) {
+    // Not a failure: a newer message arrived and the runner is about to ask
+    // again with it included. Nothing has been written to memory yet.
+    if (err.name === 'Aborted') throw err;
     console.error('[assistant] generation failed:', err.message);
     return withNotice('Something went wrong reaching the model. Try again shortly.', isFirstReply);
   }

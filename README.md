@@ -90,24 +90,35 @@ Edit `.env` and set `OLLAMA_HOST`. If Ollama runs on the same machine:
 OLLAMA_HOST=http://127.0.0.1:11434
 ```
 
-### 4. Write your persona
+### 4. Pick a persona
 
-**Do this before you connect WhatsApp.** The bundled prompt at
-`prompts/assistant.md` contains placeholders:
+**Do this before you connect WhatsApp.** `prompts/assistant.md` is the one that
+runs by default, and it ships filled in with the author's own details as a
+worked example. Left alone, it will tell your friends it works for Jack.
+
+`prompts/scenarios/` holds templates to start from instead. They differ in what
+the assistant is allowed to say, not just in tone:
+
+| File | For |
+| --- | --- |
+| `away-from-phone.md` | The general purpose one. Start here. |
+| `strict.md` | Says nothing, agrees to nothing, takes messages only. |
+| `scheduling.md` | Collects day, time and place so you can confirm in one go. |
+| `annual-leave.md` | Away until a date, with a route for anything urgent. |
+| `work-hours.md` | A work number after hours. Businesslike, careful with client detail. |
+| `screening.md` | Unknown numbers. Works out who is writing and shuts down sales. |
+| `close-contacts.md` | Friends and family. Warmer, same refusals underneath. |
+| `as-you.md` | Replies as you rather than as an assistant. A joke, with conditions. |
+| `minimal.md` | The shortest one worth running. Small models hold it better. |
+
+Every one contains `[bracketed]` placeholders. Replace all of them, or the
+assistant will text people the word `[your name]`.
+
+Point at your choice, and copy it outside the repo first if you do not want a
+`git pull` touching your wording:
 
 ```
-You are answering WhatsApp messages on behalf of [your name], who is away from
-their phone at the moment.
-```
-
-If you leave those, the assistant will text your friends the words
-`[your name]`. Replace every bracketed part.
-
-Optionally, copy it somewhere outside the repo so a `git pull` cannot overwrite your
-wording, and point at it:
-
-```
-SYSTEM_PROMPT_FILE=/home/you/persona.md
+SYSTEM_PROMPT_FILE=prompts/scenarios/away-from-phone.md
 ```
 
 See [Writing a good prompt](#writing-a-good-prompt) below.
@@ -194,14 +205,18 @@ check that line first. It is usually the answer.
 Things worth putting in yours:
 
 - **How you actually text.** Length, punctuation, whether you use full stops.
-  The default is deliberately plain, and plain is not the same as sounding like
-  you.
-- **What it must not do.** The default declines to accept invitations, agree
-  times, discuss money or speculate about where you are. Keep that, or decide
-  what yours refuses instead. A model that cheerfully accepts a dinner
-  invitation on your behalf is not a feature.
-- **What to say when it does not know.** The default says so plainly and offers
-  to pass a message on, which is almost always better than a guess.
+  The templates are deliberately plain, and plain is not the same as sounding
+  like you.
+- **What it must not do.** They all decline to accept invitations, agree times,
+  discuss money or speculate about where you are. Keep that, or decide what
+  yours refuses instead. A model that cheerfully accepts a dinner invitation on
+  your behalf is not a feature.
+- **The one or two things it may say.** Every exception has to be written down
+  or the model will not make it. `scheduling.md` names the days you keep free
+  and nothing else about your diary, which is enough to save a round trip
+  without letting it invent a slot.
+- **What to say when it does not know.** They say so plainly and offer to pass a
+  message on, which is almost always better than a guess.
 
 HTML comments are stripped before the model sees the prompt, so you can leave
 notes to yourself in the file.
@@ -226,6 +241,31 @@ knowing, so make it a decision rather than a default you inherited.
 The marker is attached in code after the model has replied, not requested in the
 prompt. Models drop instructions like that, and this one failing is invisible.
 
+### Replying as yourself
+
+`prompts/scenarios/as-you.md` writes in the first person and never mentions an
+assistant. It is the one people find funny, and it needs two settings or it does
+not work at all:
+
+```
+AI_PREFIX_MODE=never
+ALLOWED_CONTACTS=<the people in on it>
+```
+
+The marker would otherwise prefix every line, and without the allowlist the joke
+runs on everyone who has your number rather than on your friends.
+
+The prompt hedges instead of agreeing to things, which is both funnier and the
+reason nobody ends up waiting outside a pub for you. It also folds the moment
+somebody asks directly whether it is a bot, and says so rather than denying it.
+That line is deliberate. Playing along with people who are playing along is a
+joke, and lying to someone who has actually stopped to ask is not.
+
+Worth knowing what you are doing: friends texting your number get replies they
+believe are yours, with nothing marking them. That is fine for an afternoon and
+it is a different thing left running for a month, particularly for whoever tells
+you something that mattered to them and gets a decent impression of you back.
+
 ## Reply modes
 
 | Mode | Behaviour |
@@ -235,6 +275,49 @@ prompt. Models drop instructions like that, and this one failing is invisible.
 
 `prefix` is useful while you are still tuning, since nothing goes out unless
 somebody asks for it by name. `COMMAND_PREFIX` is ignored in `always` mode.
+
+## When someone corrects themselves
+
+People text in fragments, and a reply takes long enough that the next fragment
+usually lands mid-generation:
+
+```
+Sam    19:41  hey jack are you up on tuesday
+Sam    19:41  oh wait actually thursday
+```
+
+Generation starts on the first message immediately. When the second arrives, the
+in-flight request is cancelled, the two lines are joined into one turn, and the
+reply is written again from the top. Sam gets one answer about Thursday rather
+than an answer about Tuesday followed by a correction.
+
+Cancelling closes the socket, which stops Ollama generating rather than only
+throwing away the result, so an interrupted reply costs the seconds it had run
+and no more. Worth confirming on your own host, since it is the assumption the
+whole thing rests on:
+
+```bash
+curl -s http://<your ollama host>:11434/api/generate -d '{"model":"llama3.1:8b","prompt":"write 800 words about canals","stream":false}' & sleep 3; kill %1
+time curl -s http://<your ollama host>:11434/api/generate -d '{"model":"llama3.1:8b","prompt":"hi","stream":false}' -o /dev/null
+```
+
+If the second call returns in its usual time, cancellation is working.
+
+`MAX_INTERRUPTS`, default 3, caps how many times one reply may be scrapped and
+started again. Without a cap, somebody texting faster than the model generates
+would never get an answer at all. Past the cap the reply is finished and sent,
+and anything further is answered separately. `0` turns the whole thing off and
+answers every message on its own.
+
+A correction does not count against `MAX_REPLIES_PER_HOUR`, because it does not
+produce a reply of its own. Look for this in the log:
+
+```
+[assistant] <- sam@lid: hey jack are you up on tuesday
+[assistant] <- sam@lid: oh wait actually thursday
+[assistant] .. sam@lid: amended, writing it again
+[assistant] -> sam@lid: [AI] thursday is easier for me to pass on, what time?
+```
 
 ## What it will not answer
 
@@ -248,6 +331,12 @@ answers every member's every message. Status broadcasts are always ignored.
 conversation over a rolling hour, then pauses that conversation and logs it
 once. This is what stops two auto repliers, or this one and an out of office
 bot, from talking to each other all night. Zero disables it.
+
+When the cap is reached the sender gets one message saying so, since otherwise
+the assistant simply stops mid-conversation and they are left wondering. It is
+sent once per breach, not once per message, or it would become the runaway loop
+it exists to stop. `RATE_LIMIT_NOTICE` sets the wording, and an empty value
+sends nothing and returns to plain silence.
 
 **Images, stickers and voice notes.** Skipped rather than turned into an empty
 prompt. A photo with a caption is answered on the caption.
@@ -265,6 +354,7 @@ with comments.
 | --- | --- |
 | `OLLAMA_HOST` | Base URL of the Ollama instance |
 | `ASSISTANT_MODEL` | Ollama model tag, must be one you have pulled |
+| `OLLAMA_THINK` | `false` turns reasoning off, empty leaves the field unsent |
 | `SYSTEM_PROMPT_FILE` / `SYSTEM_PROMPT` | Persona, overriding the bundled default |
 | `AI_PREFIX` / `AI_PREFIX_MODE` | Wording and frequency of the marker |
 | `REPLY_MODE` | `always` or `prefix`, default `always` |
@@ -273,6 +363,8 @@ with comments.
 | `CAPTURE_IDS` | Logs sender IDs and answers nobody, for filling in the line above |
 | `ALLOW_GROUPS` | Reply in group chats, default false |
 | `MAX_REPLIES_PER_HOUR` | Per-conversation cap, default 20, zero disables |
+| `MAX_INTERRUPTS` | Restarts allowed when a sender adds to a reply in progress, default 3 |
+| `RATE_LIMIT_NOTICE` | Sent once when a conversation hits the cap, empty sends nothing |
 | `IGNORE_OLDER_THAN_SECONDS` | Drops the backlog replayed on connect |
 | `N8N_WEBHOOK_URL` | Optional, empty disables webhook logging |
 | `WEBHOOK_IN_SIM` | Fire the webhook from terminal simulation too, default false |
@@ -355,7 +447,8 @@ step 4.
 winning. Read the `[prompt] loaded from` line at startup.
 
 **It stopped replying to one person mid-conversation.** The hourly cap. There
-will be a `[limit]` line in the log. Raise `MAX_REPLIES_PER_HOUR`.
+will be a `[limit]` line in the log, and they will have been sent
+`RATE_LIMIT_NOTICE` explaining it. Raise `MAX_REPLIES_PER_HOUR`.
 
 **It ignores a group.** By design, see `ALLOW_GROUPS`.
 
@@ -376,7 +469,14 @@ URL, since there would be nowhere to send them.
 or `clientId` in `src/bots/assistant.js` changed. Scan once more.
 
 **Replies are slow.** CPU inference is the bottleneck, not prompt length. A
-smaller model helps more than a shorter prompt.
+smaller model helps more than a shorter prompt. If the model is a reasoning one,
+it is thinking before every reply and none of that reasoning is used here. Set
+`OLLAMA_THINK=false`.
+
+**It texted someone its own reasoning.** A model whose template writes thinking
+into the reply rather than into Ollama's separate field. `<think>` blocks are
+stripped in code, so a reply that reached anyone means the model used different
+tags. Set `OLLAMA_THINK=false`, or use a model that does not reason.
 
 ## Tests
 

@@ -110,7 +110,10 @@ function reportAccess() {
   );
 }
 
-function accepts(msg, limiter) {
+// A null limiter means this message will not produce a reply of its own, so it
+// has nothing to charge against the hourly cap. onLimit fires once per breach,
+// for telling the sender why they are about to be ignored.
+function accepts(msg, limiter, onLimit) {
   const chatId = msg.from;
 
   // whatsapp-web.js replays recent history on connect.
@@ -142,12 +145,13 @@ function accepts(msg, limiter) {
   const text = access.replyMode === 'prefix' ? stripPrefix(body, access.commandPrefix) : body;
   if (!text) return null;
 
-  if (!limiter.allow(chatId)) {
+  if (limiter && !limiter.allow(chatId)) {
     if (limiter.firstBreach(chatId)) {
       console.warn(
         `[limit] ${chatId} hit ${access.maxRepliesPerHour} replies in an hour, ` +
           'pausing this conversation. Raise MAX_REPLIES_PER_HOUR if this is wrong.'
       );
+      if (onLimit) onLimit(chatId);
     }
     return null;
   }
@@ -182,17 +186,82 @@ function runWhatsApp(bot) {
     reportAccess();
   });
 
-  client.on('message', (msg) => {
-    const text = accepts(msg, limiter);
-    if (!text) return;
+  // Conversations with a reply currently being written. Someone who corrects
+  // themselves mid-sentence should get one answer to the whole thing, not an
+  // answer to the half they have already taken back.
+  const writing = new Map();
 
-    const chatId = msg.from;
-    console.log(`[${bot.name}] <- ${chatId}: ${text}`);
+  /**
+   * Writes one reply, starting again whenever a newer message is added.
+   *
+   * The abort lands inside generate(), so the discarded attempt costs only the
+   * seconds it had already run, and nothing reaches memory or the sender.
+   */
+  async function answer(chatId, state) {
+    for (;;) {
+      state.controller = new AbortController();
 
-    queue.push(async () => {
-      const reply = await bot.handle(chatId, text, { isSim: false, from: chatId });
+      let reply;
+      try {
+        reply = await bot.handle(chatId, state.parts.join('\n'), {
+          isSim: false,
+          from: chatId,
+          signal: state.controller.signal,
+        });
+      } catch (err) {
+        if (err.name === 'Aborted') continue;
+        throw err;
+      }
+
+      // Cleared before sending, not after: a message arriving during the send
+      // has nothing left to amend and should start a reply of its own.
+      if (writing.get(chatId) === state) writing.delete(chatId);
+
       await client.sendMessage(chatId, reply);
       console.log(`[${bot.name}] -> ${chatId}: ${reply.slice(0, 120)}`);
+      return;
+    }
+  }
+
+  client.on('message', (msg) => {
+    const chatId = msg.from;
+    const live = writing.get(chatId);
+    const amending = Boolean(live) && live.restarts < access.maxInterrupts;
+
+    // Queued rather than sent inline, so it lands after any reply already being
+    // written for this conversation rather than jumping in front of it.
+    const text = accepts(msg, amending ? null : limiter, (id) => {
+      if (!access.rateLimitNotice) return;
+      queue.push(async () => {
+        await client.sendMessage(id, access.rateLimitNotice);
+        console.log(`[limit] told ${id} that automatic replies have paused`);
+      });
+    });
+    if (!text) return;
+
+    console.log(`[${bot.name}] <- ${chatId}: ${text}`);
+
+    if (amending) {
+      live.parts.push(text);
+      // No controller yet means the reply has not started, so the added line is
+      // already picked up and there is nothing to interrupt.
+      if (live.controller) {
+        live.restarts += 1;
+        live.controller.abort();
+        console.log(`[${bot.name}] .. ${chatId}: amended, writing it again`);
+      }
+      return;
+    }
+
+    const state = { parts: [text], restarts: 0, controller: null };
+    writing.set(chatId, state);
+
+    queue.push(async () => {
+      try {
+        await answer(chatId, state);
+      } finally {
+        if (writing.get(chatId) === state) writing.delete(chatId);
+      }
     });
   });
 
