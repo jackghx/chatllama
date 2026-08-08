@@ -1,8 +1,8 @@
 # Running it in a Proxmox LXC container
 
-Debian 12, unprivileged, with Ollama somewhere else on the network. The thing
-that catches people out is not Node. It is that whatsapp-web.js drives a real
-Chromium, and a minimal Debian container has none of the libraries it needs.
+Debian 12, unprivileged, with Ollama somewhere else on the network. Node is the
+easy part. What tends to go wrong is Chromium: whatsapp-web.js drives a real
+browser, and a minimal Debian container has none of the libraries it needs.
 
 ## What runs where
 
@@ -29,24 +29,24 @@ Chromium, and a minimal Debian container has none of the libraries it needs.
                                         +---------------------+
 ```
 
-Four moving parts, and only the middle one is what you are deploying.
+Only the container is being deployed here. The rest either already exists or is
+optional.
 
-**The container** runs Node and a headless Chromium. Chromium is what actually
-talks to WhatsApp: whatsapp-web.js drives the real web client rather than any
-API, which is why this needs a browser at all and why the container is heavier
-than a Node app has any business being.
+The container runs Node and a headless Chromium. There is no WhatsApp API in
+play: whatsapp-web.js drives the real web client in a browser, which is why a
+Node app that sends short text messages needs 2 GB of RAM.
 
-**Ollama stays where it is.** Nothing here needs it local. The container is
-waiting on a browser and a socket, Ollama wants RAM and ideally a GPU, and
-putting both in one container means sizing it for the model. `OLLAMA_HOST` in
-`.env` points across the network and that is the whole integration.
+Ollama stays wherever it already is. The container spends its time waiting on a
+browser and a socket, while Ollama wants memory and ideally a GPU, so running
+both in one container means sizing that container for the model. Setting
+`OLLAMA_HOST` in `.env` is the entire integration.
 
-**The session lives in the container**, in `.wwebjs_auth/`. That directory is a
-live credential for your WhatsApp account. Anyone holding it can send messages
-as you, and it is in every snapshot you take of the container.
+The WhatsApp session lives in the container, under `.wwebjs_auth/`. Those files
+are a working login to your account. Anyone who has them can message people as
+you, and they are included in any snapshot of the container.
 
-**n8n is optional** and talks outward only. ChatLlama POSTs to it and never
-waits for an answer.
+n8n is optional and only ever receives. ChatLlama posts to it and does not wait
+for a reply.
 
 ## Container
 
@@ -74,8 +74,8 @@ pct start 101
 pct enter 101
 ```
 
-`--onboot 1` matters. Without it the container does not come back after the host
-reboots, and pm2 inside it never gets the chance to.
+Do not skip `--onboot 1`. Without it the container stays down after the host
+reboots, and pm2 inside it never gets a chance to start anything.
 
 ## Node 20
 
@@ -90,8 +90,8 @@ node -v
 
 ## Chromium's libraries
 
-This is the step that is not optional and not obvious. Without it the first run
-fails with "Failed to launch the browser process", which says nothing useful.
+Skip this and the first run dies with "Failed to launch the browser process",
+which tells you nothing about which library is missing.
 
 ```bash
 apt install -y fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
@@ -109,9 +109,9 @@ npm install
 cp .env.example .env
 ```
 
-`npm install` downloads Chrome for Testing into `~/.cache/puppeteer` for the
-user running it. Install and run as the same user, or Chromium will not be found
-later. If you install as root, run as root.
+`npm install` downloads Chrome for Testing into `~/.cache/puppeteer`, under the
+home directory of whoever ran it. Use the same user for the install and for
+running the bot. If you install as root, run as root.
 
 ## Configuration
 
@@ -140,8 +140,8 @@ Pick a persona before connecting WhatsApp, from `prompts/scenarios/`:
 SYSTEM_PROMPT_FILE=prompts/scenarios/away-from-phone.md
 ```
 
-Then hear it before anyone else does. This needs no WhatsApp session, and tells
-you immediately whether the container can reach Ollama:
+Try it in the terminal first. No WhatsApp session is involved, and it will tell
+you straight away whether the container can reach Ollama:
 
 ```bash
 npm run assistant:sim
@@ -178,11 +178,12 @@ pm2 save
 pm2 startup systemd -u root --hp /root    # then run the command it prints
 ```
 
-`ecosystem.config.js` sets `kill_timeout: 15000` deliberately. pm2's default is
-1600 ms, which is not long enough for the shutdown flush to finish writing any
-conversation summary still pending, and a truncated flush loses it silently.
+`ecosystem.config.js` raises `kill_timeout` to 15000 on purpose. pm2 defaults to
+1600 ms and then sends SIGKILL, which is not long enough for the shutdown flush
+to write out a conversation summary that is still pending. You lose it with
+nothing in the log.
 
-Check it survives a reboot, because that is the whole point:
+Reboot the container and check it comes back on its own:
 
 ```bash
 pct reboot 101
@@ -193,9 +194,9 @@ pm2 logs assistant
 
 ## Backups, and what is in them
 
-Snapshot the container and you have snapshotted `.wwebjs_auth/`, which is a
-working login to your WhatsApp account, and `.env`, which holds your webhook
-URL. Treat container backups as credentials.
+A container snapshot includes `.wwebjs_auth/`, a working login to your WhatsApp
+account, and `.env`, which holds your webhook URL. Store those backups the way
+you would store a password.
 
 If the session ever leaks, unlink the device from your phone immediately:
 WhatsApp, Settings, Linked Devices.

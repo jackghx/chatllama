@@ -93,11 +93,11 @@ OLLAMA_HOST=http://127.0.0.1:11434
 ### 4. Pick a persona
 
 **Do this before you connect WhatsApp.** `prompts/assistant.md` is the one that
-runs by default, and it ships filled in with the author's own details as a
-worked example. Left alone, it will tell your friends it works for Jack.
+runs by default, and it is mine, filled in rather than left as a template. Leave
+it alone and it will tell your friends it works for me.
 
-`prompts/scenarios/` holds templates to start from instead. They differ in what
-the assistant is allowed to say, not just in tone:
+`prompts/scenarios/` holds files to start from instead. They differ in what the
+assistant is allowed to say rather than only in tone:
 
 | File | For |
 | --- | --- |
@@ -108,10 +108,26 @@ the assistant is allowed to say, not just in tone:
 | `work-hours.md` | A work number after hours. Businesslike, careful with client detail. |
 | `screening.md` | Unknown numbers. Works out who is writing and shuts down sales. |
 | `close-contacts.md` | Friends and family. Warmer, same refusals underneath. |
-| `as-you.md` | Replies as you rather than as an assistant. A joke, with conditions. |
 | `minimal.md` | The shortest one worth running. Small models hold it better. |
 
-Every one contains `[bracketed]` placeholders. Replace all of them, or the
+And some that are only for people who are in on it:
+
+| File | Voice |
+| --- | --- |
+| `as-you.md` | You, not an assistant. Needs `AI_PREFIX_MODE=never`. |
+| `annoying.md` | Answers every question with three more. Cheerfully useless. |
+| `brainrot.md` | Internet slang, all lower case, no punctuation. |
+| `corporate.md` | Treats a pub invitation as a resourcing decision. |
+| `noir.md` | 1940s detective. Your Thursday is a case. |
+| `victorian.md` | A butler of the 1890s, unruffled by anything. |
+| `commentator.md` | Calls the conversation like a live match. |
+
+Set `ALLOWED_CONTACTS` before running any of those, so they only reach people
+who will find them funny. They keep the same refusals as the serious ones
+underneath the voice: no times, no plans, no money, and nothing invented about
+where you are.
+
+Every file contains `[bracketed]` placeholders. Replace all of them, or the
 assistant will text people the word `[your name]`.
 
 Point at your choice, and copy it outside the repo first if you do not want a
@@ -166,7 +182,7 @@ anyone who messages the number gets a reply.
 
 You cannot guess the IDs. Recent versions of whatsapp-web.js report senders as
 `<id>@lid`, and the LID does not match the phone number, so a hand written
-`447700900000@c.us` will simply never match. Get the real values from the bot:
+`447700900000@c.us` will never match. Get the real values from the bot:
 
 ```
 CAPTURE_IDS=true
@@ -202,11 +218,11 @@ The prompt is loaded from the first of these that exists:
 Whichever wins is logged at startup, so if your edits appear to do nothing,
 check that line first. It is usually the answer.
 
-Things worth putting in yours:
+What to put in yours:
 
-- **How you actually text.** Length, punctuation, whether you use full stops.
-  The templates are deliberately plain, and plain is not the same as sounding
-  like you.
+- **How you text.** Length, punctuation, whether you use full stops. The
+  templates are plain on purpose, and plain is not the same as sounding like
+  you.
 - **What it must not do.** They all decline to accept invitations, agree times,
   discuss money or speculate about where you are. Keep that, or decide what
   yours refuses instead. A model that cheerfully accepts a dinner invitation on
@@ -255,16 +271,16 @@ ALLOWED_CONTACTS=<the people in on it>
 The marker would otherwise prefix every line, and without the allowlist the joke
 runs on everyone who has your number rather than on your friends.
 
-The prompt hedges instead of agreeing to things, which is both funnier and the
-reason nobody ends up waiting outside a pub for you. It also folds the moment
-somebody asks directly whether it is a bot, and says so rather than denying it.
-That line is deliberate. Playing along with people who are playing along is a
-joke, and lying to someone who has actually stopped to ask is not.
+The prompt hedges rather than agreeing to things, which is funnier and also why
+nobody ends up waiting outside a pub for you. Ask it directly whether it is a
+bot and it says yes. I put that line in on purpose: someone playing along is in
+on it, someone who stops to ask is not, and the joke stops being one at that
+point.
 
-Worth knowing what you are doing: friends texting your number get replies they
-believe are yours, with nothing marking them. That is fine for an afternoon and
-it is a different thing left running for a month, particularly for whoever tells
-you something that mattered to them and gets a decent impression of you back.
+Know what you are switching on, though. Friends texting your number get replies
+they think are yours, with nothing marking them. Fine for an afternoon. Less so
+after a month, and less so again for whoever tells you something that mattered
+to them and gets a passable impression of you back.
 
 ## Reply modes
 
@@ -332,11 +348,11 @@ conversation over a rolling hour, then pauses that conversation and logs it
 once. This is what stops two auto repliers, or this one and an out of office
 bot, from talking to each other all night. Zero disables it.
 
-When the cap is reached the sender gets one message saying so, since otherwise
-the assistant simply stops mid-conversation and they are left wondering. It is
-sent once per breach, not once per message, or it would become the runaway loop
-it exists to stop. `RATE_LIMIT_NOTICE` sets the wording, and an empty value
-sends nothing and returns to plain silence.
+When the cap is reached the sender gets one message saying so. Without it the
+assistant stops mid-conversation and they are left wondering why. It goes out
+once per breach rather than once per message, or it would become the runaway
+loop it is there to stop. `RATE_LIMIT_NOTICE` sets the wording, and an empty
+value sends nothing.
 
 **Images, stickers and voice notes.** Skipped rather than turned into an empty
 prompt. A photo with a caption is answered on the caption.
@@ -405,11 +421,11 @@ It sends two kinds of event, told apart by the `event` field on one URL:
 | `ai_message` | Every exchange | The message in, the reply as sent |
 | `conversation_summary` | Once, when the conversation goes quiet | A briefing, the exchange count, the transcript |
 
-The summary is the one worth notifying yourself on. A busy Saturday becomes one
-message rather than twenty, and the briefing names what the assistant would not
-decide for you: the invitation it deferred, the time it would not agree, the
-question about money it left alone. Route `ai_message` somewhere quiet, or drop
-it on the floor.
+Notify yourself on the summary and leave the other one alone. A busy Saturday
+becomes one message rather than twenty, and the briefing names what the
+assistant would not decide for you: the invitation it deferred, the time it
+would not agree, the question about money it left alone. Route `ai_message`
+somewhere quiet, or drop it.
 
 Summaries wait for silence. Every reply resets that conversation's timer, and
 `SUMMARY_IDLE_MINUTES` of quiet closes it. `SUMMARY_MAX_MESSAGES` forces one for
@@ -432,7 +448,7 @@ knowing before you rely on it as a record rather than a notification.
 ### Before you turn it on
 
 This forwards other people's messages into a channel. They are writing to what
-they believe is your phone, and a channel is a good deal less private than a one
+they believe is your phone, and a channel is a lot less private than a one
 to one chat. Tell them, or do not run it.
 
 ## Troubleshooting
@@ -534,7 +550,7 @@ Things that cost time, if you fork this:
 
 ## Scope and safeguards
 
-Deliberate constraints, worth keeping if you fork this:
+Constraints I put in on purpose. Keep them if you fork this:
 
 - The marker is applied in code, so it survives the model ignoring its
   instructions. It can be switched off, and that is a choice with someone else
@@ -553,7 +569,7 @@ Deliberate constraints, worth keeping if you fork this:
 - Never commit `.env`. Webhook URLs are unauthenticated endpoints.
 - Automating a personal WhatsApp account is against WhatsApp's terms of service
   and accounts do get banned for it. An account that replies to everything looks
-  a good deal more like automation than one that waits to be asked. Consider the
+  far more like automation than one that waits to be asked. Consider the
   official Business API for anything real.
 - Ollama has no authentication by default. Keep it on an internal interface
   rather than exposing port 11434.
