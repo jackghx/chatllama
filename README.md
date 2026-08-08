@@ -120,8 +120,7 @@ npm run assistant:sim
 
 This runs the assistant against your terminal with no WhatsApp connection. Type
 messages as if you were the other person. Go back and edit the prompt until the
-replies sound like something you would be happy to have sent in your name. This
-costs nothing and is the whole point of running a local model.
+replies sound like something you would be happy to have sent in your name.
 
 ### 6. Connect WhatsApp
 
