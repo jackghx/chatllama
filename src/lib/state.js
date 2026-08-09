@@ -17,13 +17,19 @@ const SWEEP_ABOVE = 1000;
 const SELF_SENT_MAX = 200;
 
 class RuntimeState {
-  constructor({ mode, autoGapMs = 0, autoMaxPerDay = 0 }) {
+  constructor({ mode, autoGapMs = 0, autoMaxPerDay = 0, followUpMs = 0 }) {
     // Starts from REPLY_MODE and is what the message handler actually reads.
     // Config is the setting, this is the state.
     this.mode = mode;
 
     this.autoGapMs = autoGapMs;
     this.autoMaxPerDay = autoMaxPerDay;
+    this.followUpMs = followUpMs;
+
+    // When each conversation last reached the model. While that is recent the
+    // prefix is not needed again, because nobody remembers to type it twice and
+    // the alternative is the fixed reply landing on a real question.
+    this.engaged = new Map();
 
     // When each conversation last wrote in, and how many fixed replies they
     // have had today. Both only matter in auto mode.
@@ -119,6 +125,28 @@ class RuntimeState {
     const record = this.autoReplies.get(chatId);
     if (!record || record.day !== Math.floor(at / DAY_MS)) return true;
     return record.count < this.autoMaxPerDay;
+  }
+
+  /**
+   * Whether this conversation is still talking to the model.
+   *
+   * Measured from their last answered message rather than from the one that
+   * carried the prefix, so a conversation that keeps going keeps going, and one
+   * that stops falls back to the fixed reply on its own.
+   */
+  isEngaged(chatId, at = Date.now()) {
+    if (this.followUpMs <= 0) return false;
+    const last = this.engaged.get(chatId);
+    return last !== undefined && at - last < this.followUpMs;
+  }
+
+  noteEngaged(chatId, at = Date.now()) {
+    this.engaged.set(chatId, at);
+    if (this.engaged.size > SWEEP_ABOVE) {
+      for (const [id, when] of this.engaged) {
+        if (at - when > this.followUpMs) this.engaged.delete(id);
+      }
+    }
   }
 
   noteInbound(chatId, at = Date.now()) {

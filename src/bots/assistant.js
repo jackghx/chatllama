@@ -208,13 +208,18 @@ function observe(conversationId, text, ctx) {
  * with nothing marking it as automatic and no record that it happened.
  */
 function auto(conversationId, text, ctx) {
-  if (!access.autoReplyText) return null;
+  // The runner decides the wording, because "away 30m at the gym" has to
+  // override the configured line and the runner is what holds the away state.
+  // Reading AUTO_REPLY_TEXT directly here meant the command set a wording that
+  // was then never used, and set an empty one to nobody being answered at all.
+  const body = (ctx && ctx.autoText) || access.autoReplyText;
+  if (!body) return null;
 
   const isFirstReply = memory.lines(conversationId).length === 0;
-  const reply = withNotice(access.autoReplyText, isFirstReply);
+  const reply = withNotice(body, isFirstReply);
 
   memory.push(conversationId, `User: ${text}`);
-  memory.push(conversationId, `${LABEL}: ${access.autoReplyText}`);
+  memory.push(conversationId, `${LABEL}: ${body}`);
 
   if (reportable(ctx)) {
     notify({

@@ -98,6 +98,22 @@ function stripPrefix(body, prefix) {
   return rest.trim();
 }
 
+/**
+ * The fixed reply as it goes out, with the away reason under it.
+ *
+ * The configured wording is what tells people how to reach the model, so a
+ * reason replacing it costs them that. Underneath, both survive: what to do,
+ * and why nobody is there.
+ */
+function autoReply(runtime) {
+  const fixed = access.autoReplyText;
+  const reason = runtime.awayText;
+
+  if (!reason) return fixed;
+  if (!fixed) return reason;
+  return `${fixed}\n\nReason: ${reason}`;
+}
+
 function reportAccess() {
   if (access.captureIds) {
     console.log(
@@ -225,6 +241,11 @@ function classify(msg, runtime, { simulated = false, identity = null } = {}) {
   const text = stripPrefix(body, access.commandPrefix);
   if (text) return { kind: 'model', chatId, text };
 
+  // Somebody already talking to the model stays talking to it. Asking for the
+  // prefix on every message means the second half of a question gets the fixed
+  // reply and has to be typed again, which is what people actually do.
+  if (runtime.isEngaged(chatId)) return { kind: 'model', chatId, text: body };
+
   // Everything that is not a command gets the fixed reply instead, which is the
   // whole point of auto mode: instant, and it cannot say anything wrong. With
   // no text configured there is nothing to send, so it behaves as prefix mode.
@@ -278,6 +299,7 @@ function runWhatsApp(bot) {
     mode: access.replyMode,
     autoGapMs: access.autoReplyGapMinutes * 60 * 1000,
     autoMaxPerDay: access.autoReplyMaxPerDay,
+    followUpMs: access.followUpMinutes * 60 * 1000,
   });
 
   // Built before connecting, so whatever was cached from last time is in place
@@ -434,7 +456,7 @@ function runWhatsApp(bot) {
     const ctx = {
       isSim: false,
       from: chatId,
-      autoText: runtime.awayText || access.autoReplyText,
+      autoText: autoReply(runtime),
     };
 
     // Worked out before the timestamp moves, because the gap is measured from
@@ -465,6 +487,10 @@ function runWhatsApp(bot) {
       });
       return;
     }
+
+    // Noted after classify has read it, so this message does not decide its own
+    // routing. From here the next few minutes need no prefix.
+    runtime.noteEngaged(chatId);
 
     const amending = Boolean(live) && live.restarts < access.maxInterrupts;
 
@@ -567,14 +593,23 @@ async function runSim(bot) {
     mode: access.replyMode,
     autoGapMs: access.autoReplyGapMinutes * 60 * 1000,
     autoMaxPerDay: access.autoReplyMaxPerDay,
+    followUpMs: access.followUpMinutes * 60 * 1000,
   });
 
-  const ctx = { isSim: true, from: null };
+  // autoText is read per message rather than fixed here, so that away state set
+  // during the session takes effect the same way it does over WhatsApp.
+  const context = () => ({
+    isSim: true,
+    from: null,
+    autoText: autoReply(runtime),
+  });
 
   const ask = () => {
     rl.question('you: ', (input) => {
       const text = input.trim();
       if (!text) return ask();
+
+      const ctx = context();
 
       const decision = classify(
         { from: 'sim', body: text, timestamp: Math.floor(Date.now() / 1000) },
@@ -598,11 +633,12 @@ async function runSim(bot) {
         }
 
         runtime.noteAutoReply('sim');
-        console.log(`${bot.auto ? bot.auto('sim', decision.text, ctx) : access.autoReplyText}\n`);
+        console.log(`${bot.auto ? bot.auto('sim', decision.text, ctx) : ctx.autoText}\n`);
         return ask();
       }
 
       runtime.noteInbound('sim');
+      runtime.noteEngaged('sim');
       queue.push(async () => {
         const reply = await bot.handle('sim', decision.text, ctx);
         console.log(`${reply}\n`);

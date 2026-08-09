@@ -372,9 +372,26 @@ row get one reply, and somebody coming back tomorrow gets another.
 `AUTO_REPLY_GAP_MINUTES` sets it, and `AUTO_REPLY_MAX_PER_DAY` is a floor under
 it so a slow trickle of messages cannot text somebody every hour all day.
 
+### The prefix is only needed once
+
+Nobody remembers to type `/ai` on every message, including you. Ask a question
+with the prefix, get an answer, then ask the obvious follow-up without it, and
+a bot that insisted on the prefix would send the canned line in the middle of
+your conversation and make you type the whole thing again.
+
+So once somebody has reached the model, they keep reaching it. Every answered
+message restarts a `FOLLOW_UP_MINUTES` window, default 15, measured from their
+last answer rather than from the prefix, so a conversation that keeps going
+keeps going and one that stops falls back to the fixed reply on its own. It is
+per conversation: one person opening up does not open up anybody else.
+
+Set `FOLLOW_UP_MINUTES=0` to require the prefix on every single message.
+
 A plain message that arrives while the model is already writing an answer for
-that person is recorded but not replied to. Firing the canned line into the
-middle of a real answer, seconds before it lands, reads as a glitch.
+that person joins that answer rather than starting another one, so two messages
+in a row get one reply to both. With follow-up off it is recorded and not
+replied to instead, because firing the canned line into the middle of a real
+answer, seconds before it lands, reads as a glitch.
 
 Everything they send is written into the transcript whether or not it earned a
 reply, so the briefing covers the whole conversation rather than only the
@@ -394,10 +411,41 @@ n8n, no restart.
 | `/ai away` | The same with no end time, until you send `/ai back` |
 | `/ai back` | Clears away and returns to the configured mode |
 
-Durations are `2h` or `30m` and nothing else. There is deliberately no parsing
-of "until 6", because six is in the morning, in the evening, or tomorrow, in a
-timezone nobody stated, and getting it wrong means the bot answers for you when
-you thought it had stopped.
+Durations are a number and a unit, spelled however you like:
+
+| Unit | Accepts | Example |
+| --- | --- | --- |
+| Minutes | `m`, `min`, `mins`, `minute`, `minutes` | `/ai away 30m at the gym` |
+| Hours | `h`, `hr`, `hrs`, `hour`, `hours` | `/ai away 2 hours in a meeting` |
+| Days | `d`, `day`, `days` | `/ai away 3d in Berlin` |
+| Weeks | `w`, `wk`, `wks`, `week`, `weeks` | `/ai away 1w on holiday` |
+
+Months and years are not accepted, and neither are clock times or dates. There
+is no parsing of "until 6", because six is in the morning, in the evening, or
+tomorrow, in a timezone nobody stated, and getting it wrong means the bot
+answers for you when you thought it had stopped. Anything longer than a couple
+of weeks is a change to `AUTO_REPLY_TEXT` rather than a temporary state, since
+away is held in memory and does not survive a restart.
+
+A duration it cannot read is refused rather than guessed at. `/ai away 2mo` or
+`/ai away 6pm` tells you what is valid and changes nothing, because the
+alternative is being away with no end date while people are texted the word
+"2mo".
+
+Anything after the duration is the wording people get, sent underneath
+`AUTO_REPLY_TEXT` rather than instead of it:
+
+```
+Nobody is watching this number at the moment. Send everything in one go
+rather than waiting for a reply, and it will get read. If you want an
+answer now, start a message with /ai.
+
+Reason: at the gym
+```
+
+That way setting a reason does not cost people the line telling them how to
+reach the model. Leave the duration off entirely and it stays away until you
+send `/ai back`.
 
 `OWNER_COMMANDS` defaults to `self`, meaning only your own chat counts. This
 matters: `/ai off` typed into a friend's chat is a message you have just sent
@@ -538,6 +586,7 @@ with comments.
 | `COMMAND_PREFIX` | What someone sends to reach the model, default `/ai` |
 | `AUTO_REPLY_TEXT` | The fixed reply in `auto` mode, empty sends nothing |
 | `AUTO_REPLY_GAP_MINUTES` | Silence before the same person gets it again, default 60 |
+| `FOLLOW_UP_MINUTES` | How long a conversation keeps reaching the model without the prefix, default 15. 0 requires it every time |
 | `AUTO_REPLY_MAX_PER_DAY` | Ceiling per contact per day, default 3, zero removes it |
 | `ALLOWED_CONTACTS` | Comma separated phone numbers, empty allows anyone |
 | `CONTACT_CACHE_FILE` | Where resolved identifiers are kept, default `.cache/identity.json` |

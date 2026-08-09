@@ -95,6 +95,7 @@ const CONFIG_ENV = [
   'COMMAND_PREFIX',
   'AUTO_REPLY_TEXT',
   'AUTO_REPLY_GAP_MINUTES',
+  'FOLLOW_UP_MINUTES',
   'AUTO_REPLY_MAX_PER_DAY',
   'OWNER_COMMANDS',
   'OWNER_COMMAND_ACK',
@@ -288,8 +289,16 @@ function bootRunner(env = {}, { pinMode = true } = {}) {
 /** Boots without pinning REPLY_MODE, which is how the default itself is tested. */
 const bootDefaults = (env = {}) => bootRunner(env, { pinMode: false });
 
+/**
+ * Runs a table of message bodies through one boot and asserts what each reached.
+ *
+ * Follow-up is off here on purpose. The table shares a conversation, so the
+ * first prefixed case would engage it and every plain case after that would
+ * reach the model, which is correct behaviour and would quietly stop these
+ * cases testing the prefix rules at all. Follow-up has its own section.
+ */
 async function replyModeCases(env, cases) {
-  const { seen, deliver } = bootRunner(env);
+  const { seen, deliver } = bootRunner({ FOLLOW_UP_MINUTES: '0', ...env });
   for (const [body, expected] of cases) {
     seen.length = 0;
     await deliver({ body });
@@ -300,6 +309,10 @@ async function replyModeCases(env, cases) {
     );
   }
 }
+
+// Enough of the shipped AUTO_REPLY_TEXT to recognise it without pinning the
+// exact wording here, which would make editing that sentence a test failure.
+const CONFIG_DEFAULT_AUTO_REPLY_START = 'Nobody is watching this number';
 
 async function main() {
   await section('reply mode always, the default', async () => {
@@ -426,6 +439,57 @@ async function main() {
     ]);
   });
 
+  await section('once someone uses the prefix, they stop needing it', async () => {
+    const boot = (env) =>
+      bootRunner({ REPLY_MODE: 'auto', AUTO_REPLY_TEXT: 'not here', ...env }, { pinMode: false });
+
+    const a = boot({});
+    await a.deliver({ from: 'sam@lid', body: 'hello' });
+    check('the first plain message still gets the fixed reply', () => {
+      assert.strictEqual(a.seen.length, 0);
+      assert.deepStrictEqual(a.client.sent.map((s) => s.body), ['not here']);
+    });
+
+    await a.deliver({ from: 'sam@lid', body: '/ai are you going tomorrow' });
+    await a.deliver({ from: 'sam@lid', body: 'because I need to book' });
+    check('and after the prefix, the next message reaches the model without it', () =>
+      assert.deepStrictEqual(
+        a.seen.map((s) => s.text),
+        ['are you going tomorrow', 'because I need to book']
+      )
+    );
+
+    // Each answered message restarts the clock, so a conversation that keeps
+    // going keeps going rather than expiring from when the prefix was typed.
+    check('the window is measured from the last answer, not the prefix', () => {
+      assert.ok(a.runtime.isEngaged('sam@lid'));
+      a.runtime.engaged.set('sam@lid', Date.now() - 15 * 60 * 1000 - 1);
+      assert.ok(!a.runtime.isEngaged('sam@lid'));
+    });
+
+    await a.deliver({ from: 'sam@lid', body: 'still there' });
+    check('once it lapses they are back to the fixed reply', () =>
+      assert.strictEqual(a.seen.length, 2)
+    );
+
+    const other = boot({});
+    await other.deliver({ from: 'sam@lid', body: '/ai hello' });
+    await other.deliver({ from: 'kim@lid', body: 'hello' });
+    check('one conversation opening up does not open any other', () =>
+      assert.deepStrictEqual(
+        other.seen.map((s) => s.text),
+        ['hello']
+      )
+    );
+
+    const off = boot({ FOLLOW_UP_MINUTES: '0' });
+    await off.deliver({ from: 'sam@lid', body: '/ai hello' });
+    await off.deliver({ from: 'sam@lid', body: 'and another thing' });
+    check('FOLLOW_UP_MINUTES=0 keeps the prefix required every time', () =>
+      assert.strictEqual(off.seen.length, 1)
+    );
+  });
+
   await section('the fixed reply does not interrupt a real one', async () => {
     const boot = () => {
       resetModules({
@@ -452,9 +516,13 @@ async function main() {
     check('a plain message mid-answer sends nothing', () =>
       assert.deepStrictEqual(client.sent, [])
     );
-    check('and does not scrap the answer being written', () =>
-      assert.strictEqual(ollama.prompts.length, 1)
-    );
+    // Once the prefix has opened the conversation up, the follow-up is a real
+    // message to the model rather than something to discard, so it joins the
+    // answer being written instead of being dropped as it used to be.
+    check('and is folded into the answer being written', () => {
+      assert.strictEqual(ollama.prompts.length, 2);
+      assert.ok(ollama.prompts[1].includes('also thanks'));
+    });
 
     ollama.finish('quarter past six');
     await wait(20);
@@ -464,6 +532,33 @@ async function main() {
         ['quarter past six']
       )
     );
+
+    // With follow-up switched off the original rule still holds, since the
+    // message was never going to reach the model and the fixed line would have
+    // landed in front of an answer already being written for that person.
+    resetModules({
+      REPLY_MODE: 'auto',
+      AUTO_REPLY_TEXT: 'not at my phone',
+      AI_PREFIX_MODE: 'never',
+      FOLLOW_UP_MINUTES: '0',
+    });
+    axiosStub = heldAxios();
+    require(srcFile('bots', 'assistant.js'));
+    const run2 = require(srcFile('lib', 'runner.js')).run;
+    run2(capturedBot);
+    const strict = lastClient;
+    const held = axiosStub;
+
+    await strict.emit('message', { from: 'sam@lid', timestamp: now(), body: '/ai when is the train' });
+    await settle();
+    await strict.emit('message', { from: 'sam@lid', timestamp: now(), body: 'also thanks' });
+    await settle();
+    check('with follow-up off it is dropped rather than folded in', () => {
+      assert.deepStrictEqual(strict.sent, []);
+      assert.strictEqual(held.prompts.length, 1);
+    });
+    held.finish('quarter past six');
+    await wait(20);
   });
 
   await section('commands the owner types from their own phone', async () => {
@@ -525,18 +620,91 @@ async function main() {
 
     c.client.sent.length = 0;
     await c.deliver({ from: 'kim@lid', body: 'you free' });
-    check('and the wording typed into the command is what goes out', () =>
-      assert.deepStrictEqual(
-        c.client.sent.map((s) => s.body),
-        ['in a meeting']
-      )
-    );
+    check('and the wording typed into the command goes out under the fixed reply', () => {
+      assert.strictEqual(c.client.sent.length, 1);
+      // Not instead of it: the configured line is what tells people how to
+      // reach the model, and a reason replacing it takes that away.
+      assert.ok(c.client.sent[0].body.startsWith(CONFIG_DEFAULT_AUTO_REPLY_START));
+      assert.ok(c.client.sent[0].body.endsWith('\n\nReason: in a meeting'));
+    });
 
     await c.command('/ai back');
     check('back returns to the configured mode', () => {
       assert.strictEqual(c.runtime.effectiveMode(), 'always');
       assert.strictEqual(c.runtime.awayText, '');
     });
+
+    // Typing the space is the obvious thing to do, and reading it as text meant
+    // away with no end and "30 mins at the gym" texted to people as the reply.
+    {
+      resetModules({});
+      const { parseAway } = require(srcFile('lib', 'commands.js'));
+      const cases = [
+        ['30m at the gym', 30, 'at the gym'],
+        ['30 mins at the gym', 30, 'at the gym'],
+        ['45 minutes', 45, ''],
+        ['2h', 120, ''],
+        ['2 hours driving', 120, 'driving'],
+        ['3hrs', 180, ''],
+        ['3d in Berlin', 60 * 24 * 3, 'in Berlin'],
+        ['2 days', 60 * 24 * 2, ''],
+        ['1w on holiday', 60 * 24 * 7, 'on holiday'],
+        ['2 weeks', 60 * 24 * 14, ''],
+        ['at the gym', null, 'at the gym'],
+        ['back tuesday', null, 'back tuesday'],
+        ['', null, ''],
+      ];
+      for (const [input, minutes, text] of cases) {
+        const got = parseAway(input);
+        check(`away ${JSON.stringify(input)} reads as ${minutes} min, ${JSON.stringify(text)}`, () =>
+          assert.deepStrictEqual(got, { minutes, text, bad: null })
+        );
+      }
+
+      // The old behaviour read these as the message, which left the bot away
+      // with no end and texted people the word "2mo".
+      for (const [input, bad] of [
+        ['2mo travelling', '2mo'],
+        ['3 years', '3 years'],
+        ['6pm', '6pm'],
+        ['30', '30'],
+        ['10 seconds', '10 seconds'],
+      ]) {
+        const got = parseAway(input);
+        check(`away ${JSON.stringify(input)} is refused rather than sent as text`, () =>
+          assert.deepStrictEqual(got, { minutes: null, text: '', bad })
+        );
+      }
+
+      const { runCommand } = require(srcFile('lib', 'commands.js'));
+      const { RuntimeState } = require(srcFile('lib', 'state.js'));
+
+      const rt = new RuntimeState({ mode: 'always' });
+      const refused = runCommand(rt, 'away 3 years on sabbatical');
+      check('a refused duration changes nothing and says what is valid', () => {
+        assert.strictEqual(rt.awayUntil, 0);
+        assert.strictEqual(rt.awayText, '');
+        assert.ok(refused.includes('30m, 2h, 3d, 1w'), refused);
+      });
+
+      // Nothing tested that away ever ended, only that it started.
+      const timed = new RuntimeState({ mode: 'always' });
+      runCommand(timed, 'away 30m at the gym');
+      check('away lasts exactly as long as it was given', () => {
+        assert.strictEqual(timed.effectiveMode(Date.now() + 29 * 60000), 'auto');
+        assert.strictEqual(timed.effectiveMode(Date.now() + 31 * 60000), 'always');
+      });
+      check('and clears its wording when it lapses', () =>
+        assert.strictEqual(timed.awayText, '')
+      );
+
+      const long = new RuntimeState({ mode: 'always' });
+      const ack = runCommand(long, 'away 3d in Berlin');
+      check('a long one is acknowledged in days rather than minutes', () => {
+        assert.ok(ack.includes('3 days'), ack);
+        assert.strictEqual(long.effectiveMode(Date.now() + 2 * 24 * 60 * 60000), 'auto');
+      });
+    }
 
     const stale = await boot();
     await stale.command('/ai off', { timestamp: now() - 300 });
@@ -654,6 +822,70 @@ async function main() {
     );
     check('the state says off', () =>
       assert.strictEqual(started && started.runtime.mode, 'off')
+    );
+  });
+
+  // Against the real bot, not the stub one. bootRunner deliberately supplies no
+  // auto(), so it exercises the runner's fallback and cannot see what the
+  // assistant does with the wording it is handed.
+  await section('away wording, through the bot that actually sends it', async () => {
+    const boot = async (env) => {
+      resetModules({ REPLY_MODE: 'auto', AI_PREFIX_MODE: 'never', ...env });
+      axiosStub = makeAxios(ollamaReplies('ok'));
+      require(srcFile('bots', 'assistant.js'));
+      const { run } = require(srcFile('lib', 'runner.js'));
+      run(capturedBot);
+      const client = lastClient;
+      await client.emit('ready');
+
+      return {
+        client,
+        async command(body) {
+          await client.emit('message_create', {
+            fromMe: true,
+            to: 'me@c.us',
+            timestamp: now(),
+            id: { _serialized: `own-${Math.random()}` },
+            body,
+          });
+          await settle();
+          client.sent.length = 0;
+        },
+      };
+    };
+
+    const a = await boot({ AUTO_REPLY_TEXT: 'the configured line' });
+    await a.command('/ai away 30m at the gym');
+    await a.client.emit('message', { from: 'sam@lid', timestamp: now(), body: 'you around' });
+    await settle();
+    check('the wording typed into the command is what the person gets', () =>
+      assert.deepStrictEqual(
+        a.client.sent.map((s) => s.body),
+        ['the configured line\n\nReason: at the gym']
+      )
+    );
+
+    await a.command('/ai back');
+    await a.client.emit('message', { from: 'kim@lid', timestamp: now(), body: 'hello' });
+    await settle();
+    check('and the configured line comes back afterwards', () =>
+      assert.deepStrictEqual(
+        a.client.sent.map((s) => s.body),
+        ['the configured line']
+      )
+    );
+
+    // The case for away wording at all: nothing configured, and a line set for
+    // the afternoon. Reading the configured text directly meant silence here.
+    const b = await boot({ AUTO_REPLY_TEXT: '' });
+    await b.command('/ai away 2h back later');
+    await b.client.emit('message', { from: 'sam@lid', timestamp: now(), body: 'you around' });
+    await settle();
+    check('away gives a fixed reply even when none was configured', () =>
+      assert.deepStrictEqual(
+        b.client.sent.map((s) => s.body),
+        ['back later']
+      )
     );
   });
 

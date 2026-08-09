@@ -68,6 +68,12 @@ module.exports = {
     // message is. A cooldown would fire again mid-conversation.
     autoReplyGapMinutes: num(process.env.AUTO_REPLY_GAP_MINUTES, 60),
 
+    // How long a conversation keeps reaching the model after someone has used
+    // the prefix once. Without it every single message needs the prefix, which
+    // nobody remembers, so a question gets the fixed reply and has to be typed
+    // again. 0 turns it off and makes the prefix required every time.
+    followUpMinutes: num(process.env.FOLLOW_UP_MINUTES, 15),
+
     // The floor under that, so somebody messaging just outside the gap all day
     // is not texted every hour. 0 removes it.
     autoReplyMaxPerDay: num(process.env.AUTO_REPLY_MAX_PER_DAY, 3),
