@@ -561,6 +561,26 @@ async function main() {
       assert.strictEqual(lid.runtime.mode, 'off')
     );
 
+    // The real case. WhatsApp reports the account as a phone number and keys
+    // the chat with yourself by its linked ID, and the message carries nothing
+    // joining the two, so the ID has to be resolved on ready.
+    const migrated = bootRunner();
+    migrated.client.lidLookups = { 'me@c.us': { lid: '555000111222@lid' } };
+    await migrated.client.emit('ready');
+    migrated.client.sent.length = 0;
+    await migrated.command('/ai off', { from: 'me@c.us', to: '555000111222@lid' });
+    check('your own chat is found when only its linked ID keys it', () =>
+      assert.strictEqual(migrated.runtime.mode, 'off')
+    );
+
+    const stranger = bootRunner();
+    stranger.client.lidLookups = { 'me@c.us': { lid: '555000111222@lid' } };
+    await stranger.client.emit('ready');
+    await stranger.command('/ai off', { from: 'me@c.us', to: '999999@lid' });
+    check('and resolving it does not let any other linked ID through', () =>
+      assert.strictEqual(stranger.runtime.mode, 'always')
+    );
+
     const other = await boot();
     await other.command('/ai off', { from: '99@lid', to: 'sam@lid' });
     check('and a message to somebody else is still not a command', () =>
@@ -1266,6 +1286,11 @@ async function main() {
 
     const LID = '183765432109876@lid';
 
+    // ready also resolves the owner's own account, so that the chat commands
+    // are read from is recognised whichever identifier keys it. That lookup is
+    // not what this section is about, and is covered in the commands section.
+    const lookups = (client) => client.lidCalls.filter((ids) => ids[0] !== 'me@c.us');
+
     const a = await boot(
       { ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: cacheFile() },
       { '447700900123@c.us': { lid: LID, pn: '447700900123@c.us' } }
@@ -1281,7 +1306,7 @@ async function main() {
     check('the number is looked up one at a time', () =>
       // The library wraps the batch in a single Promise.all inside the page, so
       // one bad entry in an array would reject the whole call.
-      assert.ok(a.client.lidCalls.every((ids) => ids.length === 1), JSON.stringify(a.client.lidCalls))
+      assert.ok(lookups(a.client).every((ids) => ids.length === 1), JSON.stringify(a.client.lidCalls))
     );
 
     const b = await boot(
@@ -1298,7 +1323,7 @@ async function main() {
       { '447700900123@c.us': { lid: '2222@lid' } }
     );
     check('an entry that is already an ID is never sent for lookup', () =>
-      assert.deepStrictEqual(c.client.lidCalls, [['447700900123@c.us']])
+      assert.deepStrictEqual(lookups(c.client), [['447700900123@c.us']])
     );
     await c.deliver({ from: LID, body: 'hello' });
     check('and is matched as written', () => assert.strictEqual(c.seen.length, 1));
@@ -1346,7 +1371,7 @@ async function main() {
 
     const warm2 = await boot({ ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: shared }, {});
     check('a warm cache means no lookup at all next time', () =>
-      assert.deepStrictEqual(warm2.client.lidCalls, [])
+      assert.deepStrictEqual(lookups(warm2.client), [])
     );
     await warm2.deliver({ from: LID, body: 'hello' });
     check('and the cached ID still matches', () => assert.strictEqual(warm2.seen.length, 1));
@@ -1370,7 +1395,7 @@ async function main() {
       {}
     );
     check('a stale entry is retried', () =>
-      assert.strictEqual(refreshed.client.lidCalls.length, 1)
+      assert.strictEqual(lookups(refreshed.client).length, 1)
     );
     await refreshed.deliver({ from: LID, body: 'hello' });
     check('but a failed refresh never throws away what already worked', () =>
@@ -1382,7 +1407,7 @@ async function main() {
     check('an empty ALLOWED_CONTACTS still lets anyone write in', () =>
       assert.strictEqual(open.seen.length, 1)
     );
-    check('and looks nothing up', () => assert.deepStrictEqual(open.client.lidCalls, []));
+    check('and looks nothing up', () => assert.deepStrictEqual(lookups(open.client), []));
 
     fs.rmSync(dir, { recursive: true, force: true });
   });

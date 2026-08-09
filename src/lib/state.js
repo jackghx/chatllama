@@ -39,7 +39,13 @@ class RuntimeState {
     // rather than a running commentary.
     this.captured = new Set();
 
-    // Set on ready, and the only chat owner commands are read from by default.
+    // Every identifier your own chat might be keyed by, filled in on ready.
+    // There is more than one because WhatsApp reports the account as a phone
+    // number while keying the chat itself by its linked ID, and a message the
+    // owner sent carries no field that ties the two together.
+    this.selfChats = new Set();
+
+    // The one to print. The set above is what gets matched against.
     this.selfChat = null;
 
     // Every message the bot sent. WhatsApp reports those back on the same event
@@ -65,6 +71,21 @@ class RuntimeState {
       this.awayText = '';
     }
     return this.mode;
+  }
+
+  /**
+   * Records one of the owner's own identifiers, the first becoming the one
+   * shown at startup. Only ever called with the account's own IDs, so this
+   * cannot widen who may steer the bot beyond the owner.
+   */
+  addSelfChat(id) {
+    if (!id) return;
+    if (!this.selfChat) this.selfChat = id;
+    this.selfChats.add(id);
+  }
+
+  isSelfChat(id) {
+    return Boolean(id) && this.selfChats.has(id);
   }
 
   noteSelfSent(id) {

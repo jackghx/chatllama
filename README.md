@@ -412,6 +412,12 @@ If a command does nothing, the log says why. A message starting with the prefix
 that was not accepted prints `command from <id> ignored: <reason>`, and startup
 prints a `[commands]` line naming the chat it will read them from.
 
+That line usually names two identifiers. WhatsApp reports your account as a
+phone number but keys the chat with yourself by its linked ID, and a message you
+sent carries nothing joining the two, so your own ID is resolved at startup and
+both forms are accepted. If that lookup fails it says so, and `OWNER_COMMANDS=any`
+is the way round it.
+
 ## Sending a message from n8n
 
 `SEND_API_PORT` starts a small HTTP endpoint that hands a message to the bot to

@@ -128,19 +128,19 @@ function reportAccess() {
 /**
  * Whether a message the owner sent went to their own Note to Self chat.
  *
- * Both ends of a self-chat message are you, so comparing the two sides of the
- * same message is enough, and it is the only check that holds on an account
- * WhatsApp has migrated to linked IDs. client.info.wid is whichever form the
- * page reports, preferring the phone number, while the chat itself may be
- * identified by the @lid form. Comparing against wid alone then never matches,
- * and every command is dropped as not-self.
+ * Two tests because neither covers it alone. Where both ends of the message are
+ * the same identifier, that settles it. Where they are not, the account is one
+ * WhatsApp has migrated: client.info.wid and the message's own from are the
+ * phone number, while the chat is keyed by the linked ID, and nothing on the
+ * message connects the two. That is why the owner's IDs are resolved on ready
+ * and matched as a set.
  */
 function isSelfChat(msg, runtime) {
   const from = String(msg.from || '');
   const to = String(msg.to || '');
 
   if (from && to && from === to) return true;
-  return Boolean(runtime.selfChat) && to === runtime.selfChat;
+  return runtime.isSelfChat(to);
 }
 
 /**
@@ -235,6 +235,33 @@ function classify(msg, runtime, { simulated = false, identity = null } = {}) {
   return ignore('no-match');
 }
 
+/**
+ * Adds the linked-ID form of the owner's own account to the set of chats
+ * commands are accepted from.
+ *
+ * WhatsApp reports the account as a phone number but keys the chat with
+ * yourself by its linked ID, so without this every command sent from your own
+ * phone is dropped as not-self, silently until the log line was added. The same
+ * lookup the allowlist uses, on one ID, which is the only direction that works.
+ */
+async function resolveOwnIds(client, runtime) {
+  if (access.ownerCommands !== 'self') return;
+  if (!runtime.selfChat || typeof client.getContactLidAndPhone !== 'function') return;
+
+  try {
+    const [row] = await client.getContactLidAndPhone([runtime.selfChat]);
+    // Both, because which one keys the chat is not something to guess at, and
+    // they are the account's own identifiers either way.
+    if (row && row.lid) runtime.addSelfChat(row.lid);
+    if (row && row.pn) runtime.addSelfChat(row.pn);
+  } catch (err) {
+    console.warn(
+      `[commands] could not resolve this account's other identifier: ${err.message}. ` +
+        'If commands from your own chat are ignored, set OWNER_COMMANDS=any.'
+    );
+  }
+}
+
 function runWhatsApp(bot) {
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: bot.clientId }),
@@ -273,14 +300,17 @@ function runWhatsApp(bot) {
   client.on('ready', async () => {
     // The chat with yourself, which is where owner commands are read from
     // unless OWNER_COMMANDS says otherwise.
-    runtime.selfChat = (client.info && client.info.wid && client.info.wid._serialized) || null;
+    runtime.addSelfChat((client.info && client.info.wid && client.info.wid._serialized) || null);
+    await resolveOwnIds(client, runtime);
 
     console.log(`[${bot.name}] ready, reply mode: ${runtime.effectiveMode()}`);
     console.log(
       `[commands] ${
         {
           off: 'off',
-          self: `${access.commandPrefix} from your own chat only, ${runtime.selfChat || 'own ID unknown'}`,
+          self:
+            `${access.commandPrefix} from your own chat only, ` +
+            `${[...runtime.selfChats].join(' and ') || 'own ID unknown'}`,
           any: `${access.commandPrefix} from any chat you send from`,
         }[access.ownerCommands]
       }`
