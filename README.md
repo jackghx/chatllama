@@ -262,6 +262,13 @@ An entry containing an `@` is taken exactly as written and never looked up, so
 identifiers collected the old way still work, and it is the way out if
 resolution is ever broken for you.
 
+That matters more now WhatsApp has usernames. Somebody who found you by username
+may reach you without you ever having their number, and there is no way back
+from the identifier on their message to a number to put in the list. They will
+be ignored, which is the safe failure but still a failure. Capture their `@lid`
+with `CAPTURE_IDS` and paste it in literally, which is the one case the capture
+flow is still the right tool for.
+
 ## Writing a good prompt
 
 The prompt is loaded from the first of these that exists:
@@ -400,6 +407,10 @@ public. Set `OWNER_COMMAND_ACK=false` if you would rather it obeyed silently.
 
 Commands replayed from the backlog on reconnect are ignored, so an old `/ai off`
 in your history does not switch the bot off every time it restarts.
+
+If a command does nothing, the log says why. A message starting with the prefix
+that was not accepted prints `command from <id> ignored: <reason>`, and startup
+prints a `[commands]` line naming the chat it will read them from.
 
 ## Sending a message from n8n
 

@@ -550,6 +550,21 @@ async function main() {
       assert.strictEqual(elsewhere.runtime.mode, 'always')
     );
 
+    // WhatsApp identifies the chat by whichever form it has migrated the
+    // account to, while client.info.wid prefers the phone number. Matching on
+    // wid alone drops every command on an account that has moved to linked IDs.
+    const lid = await boot();
+    await lid.command('/ai off', { from: '99@lid', to: '99@lid' });
+    check('your own chat is recognised when it is a linked ID, not the number', () =>
+      assert.strictEqual(lid.runtime.mode, 'off')
+    );
+
+    const other = await boot();
+    await other.command('/ai off', { from: '99@lid', to: 'sam@lid' });
+    check('and a message to somebody else is still not a command', () =>
+      assert.strictEqual(other.runtime.mode, 'always')
+    );
+
     const anywhere = await boot({ OWNER_COMMANDS: 'any' });
     await anywhere.command('/ai off', { to: 'sam@lid' });
     check('OWNER_COMMANDS=any accepts one from any one-to-one chat', () =>

@@ -126,6 +126,24 @@ function reportAccess() {
 }
 
 /**
+ * Whether a message the owner sent went to their own Note to Self chat.
+ *
+ * Both ends of a self-chat message are you, so comparing the two sides of the
+ * same message is enough, and it is the only check that holds on an account
+ * WhatsApp has migrated to linked IDs. client.info.wid is whichever form the
+ * page reports, preferring the phone number, while the chat itself may be
+ * identified by the @lid form. Comparing against wid alone then never matches,
+ * and every command is dropped as not-self.
+ */
+function isSelfChat(msg, runtime) {
+  const from = String(msg.from || '');
+  const to = String(msg.to || '');
+
+  if (from && to && from === to) return true;
+  return Boolean(runtime.selfChat) && to === runtime.selfChat;
+}
+
+/**
  * Works out what a message is for, without doing anything about it.
  *
  * Pure on purpose. This used to spend the sender's hourly allowance and log as
@@ -168,7 +186,7 @@ function classify(msg, runtime, { simulated = false, identity = null } = {}) {
 
   if (fromMe) {
     if (access.ownerCommands === 'off') return ignore('commands-off');
-    if (access.ownerCommands === 'self' && chatId !== runtime.selfChat) return ignore('not-self');
+    if (access.ownerCommands === 'self' && !isSelfChat(msg, runtime)) return ignore('not-self');
 
     // Regardless of ALLOW_GROUPS. An acknowledgement in a group is visible to
     // everyone in it, which is not what anyone means by a private control.
@@ -258,6 +276,15 @@ function runWhatsApp(bot) {
     runtime.selfChat = (client.info && client.info.wid && client.info.wid._serialized) || null;
 
     console.log(`[${bot.name}] ready, reply mode: ${runtime.effectiveMode()}`);
+    console.log(
+      `[commands] ${
+        {
+          off: 'off',
+          self: `${access.commandPrefix} from your own chat only, ${runtime.selfChat || 'own ID unknown'}`,
+          any: `${access.commandPrefix} from any chat you send from`,
+        }[access.ownerCommands]
+      }`
+    );
     await preflight(bot);
 
     await identity.resolve(client);
@@ -449,7 +476,18 @@ function runWhatsApp(bot) {
     if (id && runtime.selfSent.has(id)) return;
 
     const decision = classify(msg, runtime);
-    if (decision.kind !== 'command') return;
+    if (decision.kind !== 'command') {
+      // Quiet for ordinary messages you send people, loud for one that was
+      // meant to be a command and was not read as one. Without this a dropped
+      // command looks exactly like a handler that never fired, and there is
+      // nothing to go on.
+      if (stripPrefix((msg.body || '').trim(), access.commandPrefix) !== null) {
+        console.log(
+          `[${bot.name}] command from ${decision.chatId} ignored: ${decision.reason}`
+        );
+      }
+      return;
+    }
 
     const reply = runCommand(runtime, decision.text, {
       cancelAll: (reason) => {
