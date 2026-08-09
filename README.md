@@ -1,8 +1,6 @@
 # ChatLlama
 
-A self-hosted WhatsApp assistant that covers your phone while you are away from
-it, privately. Everything runs on your own machine, so the messages never leave
-it.
+A self-hosted WhatsApp assistant that messages on your behalf, privately.
 
 By default the person who messages you gets a fixed reply, with no model in the
 path. It is instant, it cannot drift, and it cannot say anything in your name
