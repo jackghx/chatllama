@@ -134,10 +134,19 @@ systemctl restart ollama
 Ollama has no authentication. Anything that reaches port 11434 can use your
 model, so keep it on the LAN and off any port forward.
 
-Pick a persona before connecting WhatsApp, from `prompts/scenarios/`:
+The default `REPLY_MODE=auto` sends a fixed reply and only reaches the model when
+someone writes `/ai`, so nothing here needs a persona to be safe. Set the wording
+you want people to get:
 
 ```
-SYSTEM_PROMPT_FILE=prompts/scenarios/away-from-phone.md
+AUTO_REPLY_TEXT=Not at my phone. Send it all in one go and I will read it.
+```
+
+If you would rather the model answered people directly, set `REPLY_MODE=always`
+and pick a persona from `prompts/scenarios/` before connecting WhatsApp:
+
+```
+SYSTEM_PROMPT_FILE=prompts/scenarios/intake.md
 ```
 
 Try it in the terminal first. No WhatsApp session is involved, and it will tell
@@ -160,14 +169,20 @@ refreshes, so a failed scan is not fatal.
 
 Afterwards the session sits in `.wwebjs_auth/` and you do not scan again.
 
-Find the contact IDs before letting it answer anyone. You cannot guess them:
+Restrict who it answers before leaving it running. Phone numbers, with the
+country code, no punctuation:
 
 ```
-CAPTURE_IDS=true
+ALLOWED_CONTACTS=447700900123,447700900456
 ```
 
-Restart, have each person message you once, read the `[capture]` lines, paste
-them into `ALLOWED_CONTACTS`, set `CAPTURE_IDS=false`, restart again.
+They are resolved to WhatsApp's own identifiers on the first run and cached
+under `.cache/`, which a container snapshot will include. Watch for the
+`[contacts]` line at startup: a number it could not resolve is named there, and
+that person will not be answered.
+
+If somebody is being ignored and you want to know why, `CAPTURE_IDS=true` logs
+each sender and whether they matched, while answering nobody.
 
 ## Keeping it up
 
@@ -195,8 +210,10 @@ pm2 logs assistant
 ## Backups, and what is in them
 
 A container snapshot includes `.wwebjs_auth/`, a working login to your WhatsApp
-account, and `.env`, which holds your webhook URL. Store those backups the way
-you would store a password.
+account, and `.env`, which holds your webhook URL and, if you use the send
+endpoint, the digest of its key. It also includes `.cache/identity.json`, which
+is the phone numbers of everyone you allowlisted paired to their WhatsApp IDs.
+Store those backups the way you would store a password.
 
 If the session ever leaks, unlink the device from your phone immediately:
 WhatsApp, Settings, Linked Devices.

@@ -1,7 +1,7 @@
 {
   "name": "chatllama",
-  "version": "2.0.0",
-  "description": "Answers WhatsApp on your behalf from a local Ollama model, and tells you what it said.",
+  "version": "3.0.0",
+  "description": "Answers WhatsApp with a fixed reply, and uses a local Ollama model to tell you what actually needs you.",
   "main": "src/bots/assistant.js",
   "scripts": {
     "test": "node test/harness.js",
@@ -15,7 +15,7 @@
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.23.0"
+    "whatsapp-web.js": "^1.34.7"
   },
   "license": "MIT",
   "private": false

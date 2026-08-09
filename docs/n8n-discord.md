@@ -18,6 +18,7 @@ One per exchange, the full log.
   "from": "1234567890@lid",
   "userMessage": "are you around this evening",
   "botReply": "[AI] Not at my phone right now, I have passed it on.",
+  "automatic": false,
   "timestamp": "2026-08-08T20:09:10.460Z"
 }
 ```
@@ -25,6 +26,10 @@ One per exchange, the full log.
 `botReply` is the message as sent, so it includes the self-disclosure notice if
 one was attached. In `first` mode most lines in a conversation will not carry
 it.
+
+`automatic` is true when the fixed reply went out with no model involved, which
+in `auto` mode is most of them. Filter on it if you only want to see what the
+model actually wrote.
 
 ## conversation_summary
 
@@ -38,7 +43,13 @@ yourself with.
   "from": "1234567890@lid",
   "reason": "idle",
   "messages": 5,
-  "summary": "Sam asked about Saturday and settled on climbing at the Depot around 11 with food after. The assistant gave a soft yes but would not book or pay. Sam also asked whether you can afford the nicer food place, which was left for you. He wants a text.",
+  "summary": "Sam wants to climb at the Depot on Saturday around 11. Needs an answer by Friday.",
+  "triage": {
+    "urgency": "today",
+    "wants": "Sam wants to climb at the Depot on Saturday around 11.",
+    "deadline": "Friday",
+    "draftReply": "11 on Saturday works. Book it and I will send you my half."
+  },
   "transcript": ["User: yo you around this weekend?", "Assistant: ..."],
   "timestamp": "2026-08-08T20:21:44.117Z"
 }
@@ -50,6 +61,32 @@ stopped with a summary still pending.
 
 `summary` is empty if the model could not be reached. `transcript` still holds
 the exchange, so the notification is worth sending either way.
+
+### The triage fields
+
+`triage.urgency` is always one of `now`, `today` or `whenever`, so a Switch node
+can branch on it without a fallback for something the model made up. Send `now`
+to a channel that notifies you and `whenever` to one you read on Sunday. This is
+the field worth building the workflow around: deciding what actually needs you
+is the job a fixed auto-reply cannot do.
+
+`triage.draftReply` is written as you, in the first person, ready to send. Wire
+a Discord button to the send endpoint and replying becomes one tap:
+
+```
+POST http://<host>:<SEND_API_PORT>/send
+x-api-key: <the key, not the digest>
+
+{ "to": "{{ $json.body.from }}", "text": "{{ $json.body.triage.draftReply }}" }
+```
+
+Nothing drafted is ever sent on its own. The endpoint only moves when something
+calls it.
+
+`triage` is `null` when the model did not produce usable fields, so check for it
+before reading into it. `summary` is a string either way, which is why the nodes
+below still read that rather than the object. Set `SUMMARY_FORMAT=prose` to turn
+the whole thing off and get the old free-text briefing back.
 
 ## Timing
 

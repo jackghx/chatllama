@@ -5,6 +5,7 @@ const { assistant } = require('../config');
 const PROMPTS = path.join(__dirname, '..', '..', 'prompts');
 const DEFAULT_FILE = path.join(PROMPTS, 'assistant.md');
 const SUMMARY_FILE = path.join(PROMPTS, 'summary.md');
+const TRIAGE_FILE = path.join(PROMPTS, 'triage.md');
 
 const stripComments = (text) => text.replace(/<!--[\s\S]*?-->/g, '');
 
@@ -33,10 +34,15 @@ function loadSystemPrompt() {
   };
 }
 
-// No environment override. This one shapes a machine-readable briefing rather
-// than a persona, so it is edited in place on the rare occasion it needs to be.
+// No environment override. These shape a machine-readable briefing rather than
+// a persona, so they are edited in place on the rare occasion they need to be.
+// summary.md is the prose briefing, triage.md the structured one.
 function loadSummaryPrompt() {
   return stripComments(fs.readFileSync(SUMMARY_FILE, 'utf8')).trim();
 }
 
-module.exports = { loadSystemPrompt, loadSummaryPrompt };
+function loadTriagePrompt() {
+  return stripComments(fs.readFileSync(TRIAGE_FILE, 'utf8')).trim();
+}
+
+module.exports = { loadSystemPrompt, loadSummaryPrompt, loadTriagePrompt };

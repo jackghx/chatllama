@@ -58,7 +58,11 @@ async function generate({
   signal,
 }) {
   const body = { model, prompt, stream: false, options: { ...options } };
-  if (stop && stop.length) body.options.stop = stop;
+  // Deliberately ignored alongside format rather than left to the caller. A stop
+  // sequence the model then writes inside a string value truncates the document
+  // mid-object, and the result is unparseable in a way that looks like the model
+  // failing rather than the request being wrong.
+  if (stop && stop.length && !format) body.options.stop = stop;
   if (format) body.format = format;
   // Only sent when configured. Some builds reject the field outright on a model
   // that has no thinking capability, so an unset variable changes nothing.
@@ -79,7 +83,11 @@ async function generate({
     throw err;
   }
 
-  return stripThinking(String(res.data?.response ?? ''));
+  const text = String(res.data?.response ?? '');
+  // Structured output goes back untouched. The unclosed-tag rule below cuts
+  // everything after a <think> that never closes, which would silently eat the
+  // tail of any JSON document containing that literal.
+  return format ? text.trim() : stripThinking(text);
 }
 
 module.exports = { listModels, generate, Aborted };

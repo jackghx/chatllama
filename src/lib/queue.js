@@ -11,9 +11,23 @@ class SerialQueue {
     return this.tasks.length;
   }
 
+  /**
+   * Returns a promise that settles when the task has finished, so a caller that
+   * has to wait for the work can, without giving up the serialisation. It never
+   * rejects: a failing task is logged in drain() and the queue carries on.
+   */
   push(task) {
-    this.tasks.push(task);
+    const done = new Promise((resolve) => {
+      this.tasks.push(async () => {
+        try {
+          await task();
+        } finally {
+          resolve();
+        }
+      });
+    });
     this.drain();
+    return done;
   }
 
   async drain() {

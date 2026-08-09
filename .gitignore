@@ -10,6 +10,10 @@
 .wwebjs_cache/
 sessions/
 
+# Resolved contact identifiers. Not credentials, but it is a list of the phone
+# numbers of everyone you have allowlisted, paired to their WhatsApp IDs.
+.cache/
+
 # Node
 node_modules/
 npm-debug.log*

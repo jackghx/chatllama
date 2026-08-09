@@ -21,6 +21,8 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
 const Module = require('module');
 
 const REPO = process.env.HARNESS_REPO
@@ -38,7 +40,17 @@ class ClientStub {
     this.opts = opts;
     this.handlers = {};
     this.sent = [];
+    this.info = { wid: { _serialized: 'me@c.us' } };
+    // Scripted per test. A map from requested ID to the row the page returns,
+    // or a function, so a test can also make the lookup reject.
+    this.lidLookups = null;
+    this.lidCalls = [];
     lastClient = this;
+  }
+  async getContactLidAndPhone(ids) {
+    this.lidCalls.push(ids);
+    if (typeof this.lidLookups === 'function') return this.lidLookups(ids);
+    return ids.map((id) => (this.lidLookups && this.lidLookups[id]) || {});
   }
   on(event, fn) {
     this.handlers[event] = fn;
@@ -46,6 +58,9 @@ class ClientStub {
   initialize() {}
   async sendMessage(to, body) {
     this.sent.push({ to, body });
+    // The real client hands back the Message it created, which is how the
+    // runner recognises its own text arriving on message_create.
+    return { id: { _serialized: `sent-${this.sent.length}` } };
   }
   emit(event, arg) {
     if (this.handlers[event]) return this.handlers[event](arg);
@@ -77,8 +92,16 @@ const CONFIG_ENV = [
   'OLLAMA_THINK',
   'REPLY_MODE',
   'COMMAND_PREFIX',
+  'AUTO_REPLY_TEXT',
+  'AUTO_REPLY_GAP_MINUTES',
+  'AUTO_REPLY_MAX_PER_DAY',
+  'OWNER_COMMANDS',
+  'OWNER_COMMAND_ACK',
   'ALLOWED_CONTACTS',
   'CAPTURE_IDS',
+  'CONTACT_CACHE_FILE',
+  'CONTACT_CACHE_TTL_DAYS',
+  'CONTACT_RESOLVE_DELAY_MS',
   'IGNORE_OLDER_THAN_SECONDS',
   'ALLOW_GROUPS',
   'MAX_REPLIES_PER_HOUR',
@@ -94,6 +117,13 @@ const CONFIG_ENV = [
   'WEBHOOK_IN_SIM',
   'SUMMARY_IDLE_MINUTES',
   'SUMMARY_MAX_MESSAGES',
+  'SUMMARY_FORMAT',
+  'SUMMARY_MODEL',
+  'SEND_API_PORT',
+  'SEND_API_HOST',
+  'SEND_API_KEY_SHA512',
+  'SEND_API_MAX_PER_MINUTE',
+  'SEND_API_ALLOW_ANY',
 ];
 
 /**
@@ -135,6 +165,34 @@ const ollamaReplies = (text) => ({
   '/api/generate': async () => ({ data: { response: text } }),
 });
 
+/**
+ * axios stub that hangs until released, and rejects if the caller aborts first.
+ * Real generation is the only slow part of a reply, so holding it open is what
+ * puts the runner in the state a second message, or a cancellation, arrives into.
+ */
+const heldAxios = () => {
+  const prompts = [];
+  let release = null;
+  return {
+    prompts,
+    calls: [],
+    posts: () => [],
+    finish: (text) => release && release(text),
+    async get() {
+      return { data: { models: [] } };
+    },
+    post(url, body, cfg) {
+      prompts.push(body.prompt);
+      return new Promise((resolve, reject) => {
+        release = (text) => resolve({ data: { response: text } });
+        if (cfg?.signal) {
+          cfg.signal.addEventListener('abort', () => reject(new Error('socket closed')));
+        }
+      });
+    },
+  };
+};
+
 const results = [];
 function check(name, fn) {
   try {
@@ -175,30 +233,58 @@ async function capturingLogs(fn) {
 // Anything older than IGNORE_OLDER_THAN_SECONDS is treated as replayed backlog.
 const now = () => Math.floor(Date.now() / 1000);
 
-/** Boots the runner with a recording handler and returns the delivery helpers. */
-function bootRunner(env = {}) {
-  resetModules(env);
+/**
+ * Boots the runner with a recording handler and returns the delivery helpers.
+ *
+ * REPLY_MODE is pinned rather than left to the default. Every section below
+ * asserts what a particular mode does, so inheriting the default would mean
+ * changing it silently rewrote what all of them were testing. The shipped
+ * default has its own section instead.
+ */
+function bootRunner(env = {}, { pinMode = true } = {}) {
+  resetModules(pinMode ? { REPLY_MODE: 'always', ...env } : env);
   axiosStub = makeAxios();
   const { run } = require(srcFile('lib', 'runner.js'));
   const seen = [];
-  run({
+  const observed = [];
+  const started = run({
     name: 'test',
     clientId: 'test',
     handle: async (id, text) => {
       seen.push({ id, text });
       return 'ok';
     },
+    // No auto() on purpose, so the runner's own fallback is what gets exercised.
+    observe: (id, text) => observed.push({ id, text }),
   });
   const client = lastClient;
   return {
     seen,
+    observed,
     client,
+    runtime: started && started.runtime,
+    server: started && started.server,
     async deliver(msg) {
       await client.emit('message', { from: 'x@lid', timestamp: now(), ...msg });
       await settle();
     },
+    /** A message the owner typed, which arrives on the other event. */
+    async command(body, extra = {}) {
+      await client.emit('message_create', {
+        fromMe: true,
+        to: 'me@c.us',
+        timestamp: now(),
+        id: { _serialized: `own-${Math.random()}` },
+        body,
+        ...extra,
+      });
+      await settle();
+    },
   };
 }
+
+/** Boots without pinning REPLY_MODE, which is how the default itself is tested. */
+const bootDefaults = (env = {}) => bootRunner(env, { pinMode: false });
 
 async function replyModeCases(env, cases) {
   const { seen, deliver } = bootRunner(env);
@@ -251,10 +337,319 @@ async function main() {
     ])
   );
 
+  await section('reply mode auto, a fixed reply with the model on request', async () => {
+    const FIXED = 'not at my phone, send it all in one go';
+    const env = { REPLY_MODE: 'auto', AUTO_REPLY_TEXT: FIXED };
+
+    const a = bootRunner(env);
+    await a.deliver({ body: 'you around this evening' });
+    check('a plain message gets the fixed reply', () =>
+      assert.deepStrictEqual(
+        a.client.sent.map((s) => s.body),
+        [FIXED]
+      )
+    );
+    check('and never reaches the model', () => assert.strictEqual(a.seen.length, 0));
+
+    await a.deliver({ body: '/ai what time do you finish' });
+    check('the command still reaches the model', () =>
+      assert.deepStrictEqual(
+        a.seen.map((s) => s.text),
+        ['what time do you finish']
+      )
+    );
+
+    // The gap is measured from their last message, so a burst is one reply.
+    const b = bootRunner(env);
+    await b.deliver({ body: 'hello' });
+    await b.deliver({ body: 'you there' });
+    await b.deliver({ body: 'anyone' });
+    check('a burst gets one fixed reply, not one each', () =>
+      assert.strictEqual(b.client.sent.length, 1)
+    );
+    check('the messages that got no reply are still recorded for the briefing', () =>
+      assert.deepStrictEqual(
+        b.observed.map((o) => o.text),
+        ['you there', 'anyone']
+      )
+    );
+
+    const c = bootRunner({ ...env, AUTO_REPLY_GAP_MINUTES: '0.004' });
+    await c.deliver({ body: 'first' });
+    await wait(400);
+    await c.deliver({ body: 'back again later' });
+    check('someone coming back after a gap gets it again', () =>
+      assert.strictEqual(c.client.sent.length, 2)
+    );
+
+    const d = bootRunner({ ...env, AUTO_REPLY_GAP_MINUTES: '0', AUTO_REPLY_MAX_PER_DAY: '2' });
+    for (const body of ['one', 'two', 'three', 'four']) await d.deliver({ body });
+    check('the daily ceiling stops it repeating all day', () =>
+      assert.strictEqual(d.client.sent.length, 2)
+    );
+
+    const e = bootRunner({ REPLY_MODE: 'off', AUTO_REPLY_TEXT: FIXED });
+    await e.deliver({ body: 'hello' });
+    await e.deliver({ body: '/ai are you there' });
+    check('off answers nothing at all, command or not', () => {
+      assert.deepStrictEqual(e.client.sent, []);
+      assert.strictEqual(e.seen.length, 0);
+    });
+
+    // Sent by the bot rather than straight from the runner, so that the one
+    // outbound message with no model behind it is not also the one message with
+    // nothing marking it as automatic.
+    resetModules({ REPLY_MODE: 'auto', AUTO_REPLY_TEXT: FIXED });
+    axiosStub = makeAxios(ollamaReplies('unused'));
+    require(srcFile('bots', 'assistant.js'));
+    const { run } = require(srcFile('lib', 'runner.js'));
+    run(capturedBot);
+    const marked = lastClient;
+    await marked.emit('message', { from: 'sam@lid', timestamp: now(), body: 'hello' });
+    await settle();
+    check('the fixed reply still carries the disclosure marker', () =>
+      assert.deepStrictEqual(
+        marked.sent.map((s) => s.body),
+        [`[AI] ${FIXED}`]
+      )
+    );
+
+    // With nothing to send, auto has nothing to do that prefix does not, so it
+    // should behave identically. Same table as the prefix section above.
+    await replyModeCases({ REPLY_MODE: 'auto', AUTO_REPLY_TEXT: '' }, [
+      ['/ai what is 2+2', 'what is 2+2'],
+      ['/airplanes are loud', null],
+      ['/ai', null],
+      ['hello there', null],
+    ]);
+  });
+
+  await section('the fixed reply does not interrupt a real one', async () => {
+    const boot = () => {
+      resetModules({
+        REPLY_MODE: 'auto',
+        AUTO_REPLY_TEXT: 'not at my phone',
+        AI_PREFIX_MODE: 'never',
+      });
+      axiosStub = heldAxios();
+      require(srcFile('bots', 'assistant.js'));
+      const { run } = require(srcFile('lib', 'runner.js'));
+      const started = run(capturedBot);
+      return { client: lastClient, ollama: axiosStub, runtime: started && started.runtime };
+    };
+
+    const { client, ollama } = boot();
+    await client.emit('message', { from: 'sam@lid', timestamp: now(), body: '/ai when is the train' });
+    await settle();
+    check('the command starts generating', () => assert.strictEqual(ollama.prompts.length, 1));
+
+    await client.emit('message', { from: 'sam@lid', timestamp: now(), body: 'also thanks' });
+    await settle();
+    // Firing the fixed line here would drop "not at my phone" into the middle
+    // of an answer being written for that same person, seconds before it lands.
+    check('a plain message mid-answer sends nothing', () =>
+      assert.deepStrictEqual(client.sent, [])
+    );
+    check('and does not scrap the answer being written', () =>
+      assert.strictEqual(ollama.prompts.length, 1)
+    );
+
+    ollama.finish('quarter past six');
+    await wait(20);
+    check('the real answer still arrives', () =>
+      assert.deepStrictEqual(
+        client.sent.map((s) => s.body),
+        ['quarter past six']
+      )
+    );
+  });
+
+  await section('commands the owner types from their own phone', async () => {
+    // ready is what tells the runner which chat is its own.
+    const boot = async (env = {}) => {
+      const r = bootRunner(env);
+      await r.client.emit('ready');
+      r.client.sent.length = 0;
+      return r;
+    };
+
+    const inbound = { from: 'sam@lid', to: 'me@c.us', timestamp: now(), body: 'hello' };
+
+    const dup = await boot();
+    await dup.client.emit('message_create', inbound);
+    await dup.client.emit('message', inbound);
+    await settle();
+    // Both events fire for every message that arrives, message_create first.
+    check('a message arriving on both events is handled once', () =>
+      assert.strictEqual(dup.seen.length, 1)
+    );
+
+    const echo = await boot();
+    await echo.deliver({ from: 'sam@lid', body: 'hi' });
+    const ownId = { _serialized: 'sent-1' };
+    await echo.command('/ai off', { id: ownId });
+    check('the bot does not read its own outgoing message as a command', () =>
+      assert.strictEqual(echo.runtime.mode, 'always')
+    );
+
+    const c = await boot();
+    await c.command('/ai status');
+    check('status answers in the same chat', () => {
+      assert.strictEqual(c.client.sent.length, 1);
+      assert.ok(c.client.sent[0].body.includes('mode always'));
+    });
+    check('status changes nothing', () => assert.strictEqual(c.runtime.mode, 'always'));
+
+    await c.command('/ai off');
+    await c.deliver({ from: 'sam@lid', body: 'anyone there' });
+    check('off stops the model answering', () => {
+      assert.strictEqual(c.runtime.mode, 'off');
+      assert.strictEqual(c.seen.length, 0);
+    });
+
+    await c.command('/ai on');
+    await c.deliver({ from: 'sam@lid', body: 'and now' });
+    check('on puts the configured mode back', () => {
+      assert.strictEqual(c.runtime.mode, 'always');
+      assert.strictEqual(c.seen.length, 1);
+    });
+
+    await c.command('/ai away 2h in a meeting');
+    check('away switches to the fixed reply without touching REPLY_MODE', () => {
+      assert.strictEqual(c.runtime.effectiveMode(), 'auto');
+      assert.strictEqual(c.runtime.mode, 'always');
+      assert.strictEqual(c.runtime.awayText, 'in a meeting');
+    });
+
+    c.client.sent.length = 0;
+    await c.deliver({ from: 'kim@lid', body: 'you free' });
+    check('and the wording typed into the command is what goes out', () =>
+      assert.deepStrictEqual(
+        c.client.sent.map((s) => s.body),
+        ['in a meeting']
+      )
+    );
+
+    await c.command('/ai back');
+    check('back returns to the configured mode', () => {
+      assert.strictEqual(c.runtime.effectiveMode(), 'always');
+      assert.strictEqual(c.runtime.awayText, '');
+    });
+
+    const stale = await boot();
+    await stale.command('/ai off', { timestamp: now() - 300 });
+    // Replayed history includes the owner's own messages. Without the backlog
+    // filter covering this path, every restart would re-run old commands.
+    check('a command replayed from the backlog is ignored', () =>
+      assert.strictEqual(stale.runtime.mode, 'always')
+    );
+
+    const elsewhere = await boot();
+    await elsewhere.command('/ai off', { to: 'sam@lid' });
+    check('by default a command only counts in your own chat', () =>
+      assert.strictEqual(elsewhere.runtime.mode, 'always')
+    );
+
+    const anywhere = await boot({ OWNER_COMMANDS: 'any' });
+    await anywhere.command('/ai off', { to: 'sam@lid' });
+    check('OWNER_COMMANDS=any accepts one from any one-to-one chat', () =>
+      assert.strictEqual(anywhere.runtime.mode, 'off')
+    );
+
+    const grouped = await boot({ OWNER_COMMANDS: 'any', ALLOW_GROUPS: 'true' });
+    await grouped.command('/ai off', { to: '123@g.us' });
+    check('but never from a group, where the answer would be public', () =>
+      assert.strictEqual(grouped.runtime.mode, 'always')
+    );
+
+    const disabled = await boot({ OWNER_COMMANDS: 'off' });
+    await disabled.command('/ai off');
+    check('OWNER_COMMANDS=off ignores them entirely', () =>
+      assert.strictEqual(disabled.runtime.mode, 'always')
+    );
+
+    const quiet = await boot({ OWNER_COMMAND_ACK: 'false' });
+    await quiet.command('/ai off');
+    check('the acknowledgement can be switched off without losing the command', () => {
+      assert.strictEqual(quiet.runtime.mode, 'off');
+      assert.deepStrictEqual(quiet.client.sent, []);
+    });
+
+    const unknown = await boot();
+    await unknown.command('/ai wibble');
+    check('an unknown command says so rather than doing nothing', () =>
+      assert.ok(unknown.client.sent[0].body.includes('Not a command'))
+    );
+  });
+
+  await section('switching off stops a reply already being written', async () => {
+    resetModules({ REPLY_MODE: 'always', AI_PREFIX_MODE: 'never' });
+    axiosStub = heldAxios();
+    require(srcFile('bots', 'assistant.js'));
+    const { run } = require(srcFile('lib', 'runner.js'));
+    const started = run(capturedBot);
+    const client = lastClient;
+    const ollama = axiosStub;
+    await client.emit('ready');
+
+    await client.emit('message', { from: 'sam@lid', timestamp: now(), body: 'you around' });
+    await settle();
+    check('the reply is under way', () => assert.strictEqual(ollama.prompts.length, 1));
+
+    await client.emit('message_create', {
+      fromMe: true,
+      to: 'me@c.us',
+      timestamp: now(),
+      id: { _serialized: 'own-1' },
+      body: '/ai off',
+    });
+    await wait(20);
+    // Going quiet for new messages while still sending the ones already in
+    // flight is not off, it is off in a minute.
+    check('the answer in flight is dropped rather than finished', () =>
+      assert.strictEqual(
+        client.sent.filter((s) => s.to === 'sam@lid').length,
+        0
+      )
+    );
+    check('and it is not simply written again', () =>
+      assert.strictEqual(ollama.prompts.length, 1)
+    );
+    check('the state says off', () =>
+      assert.strictEqual(started && started.runtime.mode, 'off')
+    );
+  });
+
+  await section('the shipped default, with nothing configured', async () => {
+    const d = bootDefaults();
+    await d.deliver({ body: 'you around this evening' });
+    check('a plain message gets the fixed reply out of the box', () =>
+      assert.strictEqual(d.client.sent.length, 1)
+    );
+    check('with no model in the path at all', () => assert.strictEqual(d.seen.length, 0));
+
+    await d.deliver({ body: '/ai what time do you finish' });
+    check('the command is what reaches the model', () =>
+      assert.deepStrictEqual(
+        d.seen.map((s) => s.text),
+        ['what time do you finish']
+      )
+    );
+
+    const back = bootDefaults({ REPLY_MODE: 'always' });
+    await back.deliver({ body: 'plain message' });
+    check('REPLY_MODE=always is the way back to the old behaviour', () =>
+      assert.strictEqual(back.seen.length, 1)
+    );
+  });
+
   await section('an unrecognised REPLY_MODE falls back rather than failing', async () => {
-    const { seen, deliver } = bootRunner({ REPLY_MODE: 'nonsense' });
+    const { seen, client, deliver } = bootDefaults({ REPLY_MODE: 'nonsense' });
     await deliver({ body: 'plain message' });
-    check('falls back to always', () => assert.strictEqual(seen.length, 1));
+    check('falls back to the default rather than refusing to start', () => {
+      assert.strictEqual(seen.length, 0);
+      assert.strictEqual(client.sent.length, 1);
+    });
   });
 
   await section('group chats', async () => {
@@ -457,36 +852,8 @@ async function main() {
   });
 
   await section('a sender who corrects themselves', async () => {
-    /**
-     * axios stub that hangs until released, and rejects if the caller aborts
-     * first. Real generation is the only slow part of a reply, so holding it
-     * open is what puts the runner in the state a second message arrives into.
-     */
-    const heldAxios = () => {
-      const prompts = [];
-      let release = null;
-      return {
-        prompts,
-        calls: [],
-        posts: () => [],
-        finish: (text) => release && release(text),
-        async get() {
-          return { data: { models: [] } };
-        },
-        post(url, body, cfg) {
-          prompts.push(body.prompt);
-          return new Promise((resolve, reject) => {
-            release = (text) => resolve({ data: { response: text } });
-            if (cfg?.signal) {
-              cfg.signal.addEventListener('abort', () => reject(new Error('socket closed')));
-            }
-          });
-        },
-      };
-    };
-
     const boot = (env = {}) => {
-      resetModules(env);
+      resetModules({ REPLY_MODE: 'always', ...env });
       axiosStub = heldAxios();
       require(srcFile('bots', 'assistant.js'));
       const { run } = require(srcFile('lib', 'runner.js'));
@@ -603,6 +970,67 @@ async function main() {
     });
   });
 
+  await section('a reply that is called off', async () => {
+    const boot = () => {
+      resetModules({ REPLY_MODE: 'always', AI_PREFIX_MODE: 'never' });
+      axiosStub = heldAxios();
+      require(srcFile('bots', 'assistant.js'));
+      const { run } = require(srcFile('lib', 'runner.js'));
+      const started = run(capturedBot);
+      return { client: lastClient, ollama: axiosStub, runtime: started && started.runtime };
+    };
+
+    const first = boot();
+    check('the runner hands back the state it is working from', () =>
+      assert.ok(first.runtime && first.runtime.writing instanceof Map)
+    );
+
+    await first.client.emit('message', { from: 'sam@lid', timestamp: now(), body: 'you around' });
+    await settle();
+    check('the reply starts being written', () =>
+      assert.strictEqual(first.ollama.prompts.length, 1)
+    );
+
+    // Guarded rather than called straight: against a source that returns a bare
+    // client this is undefined, and throwing here would take the whole
+    // differential run down instead of failing one check.
+    const stopped = first.runtime
+      ? first.runtime.cancel('sam@lid', 'called off')
+      : 'the runner returned no state';
+    await wait(20);
+    check('cancelling reports that there was something to stop', () =>
+      assert.strictEqual(stopped, true)
+    );
+    // The bug this guards. answer() loops on any abort, so a cancellation with
+    // no new text to add used to regenerate the same reply immediately, and
+    // forever, because every attempt was aborted the same way.
+    check('the abandoned reply is not written again', () =>
+      assert.strictEqual(first.ollama.prompts.length, 1)
+    );
+    check('nothing reaches the sender', () => assert.deepStrictEqual(first.client.sent, []));
+    check('the conversation is no longer being written for', () =>
+      assert.strictEqual(first.runtime && first.runtime.writing.has('sam@lid'), false)
+    );
+    check('cancelling a conversation with nothing in flight changes nothing', () =>
+      assert.strictEqual(first.runtime && first.runtime.cancel('nobody@lid', 'off'), false)
+    );
+
+    // Set directly rather than through cancel(), because this is the race
+    // cancel() cannot produce: the reply finished generating in the moment
+    // between the decision to drop it and the abort landing, so aborting the
+    // finished request did nothing and only the flag is left to catch it.
+    const second = boot();
+    await second.client.emit('message', { from: 'kim@lid', timestamp: now(), body: 'hello' });
+    await settle();
+    const live = second.runtime && second.runtime.writing.get('kim@lid');
+    if (live) live.cancelled = 'called off';
+    second.ollama.finish('too late');
+    await wait(20);
+    check('a reply that finished just as it was dropped is still not sent', () =>
+      assert.deepStrictEqual(second.client.sent, [])
+    );
+  });
+
   await section('bundled prompts', async () => {
     const dir = path.join(REPO, 'prompts');
     const strip = (f) => fs.readFileSync(f, 'utf8').replace(/<!--[\s\S]*?-->/g, '').trim();
@@ -716,30 +1144,38 @@ async function main() {
     });
 
     const captured = lines.filter((l) => l.startsWith('[capture]'));
-    check('the sender ID is logged in the form ALLOWED_CONTACTS takes', () =>
-      assert.ok(captured.includes('[capture] 183765432109876@lid'), JSON.stringify(lines))
+    check('the sender ID is logged', () =>
+      assert.ok(
+        captured.some((l) => l.startsWith('[capture] 183765432109876@lid')),
+        JSON.stringify(lines)
+      )
     );
     check('a second sender is logged too', () =>
-      assert.ok(captured.includes('[capture] 274839201847362@lid'))
+      assert.ok(captured.some((l) => l.startsWith('[capture] 274839201847362@lid')))
     );
     check('the same sender writing again is not logged twice', () =>
       assert.strictEqual(captured.length, 2, JSON.stringify(captured))
     );
 
-    // Without this, capture mode would be no help against an allowlist holding
-    // a guessed ID, which is the case it exists for.
+    // Now that the numbers resolve themselves, there is nothing to paste and
+    // the only question left is why somebody is being ignored. So capture says
+    // whether the ID matched, which is the answer.
     const withList = await capturingLogs(async () => {
       const { seen, deliver } = bootRunner({
         CAPTURE_IDS: 'true',
-        ALLOWED_CONTACTS: 'guessed@c.us',
+        ALLOWED_CONTACTS: 'guessed@c.us,183765432109876@lid',
       });
       await deliver({ from: '183765432109876@lid', body: 'hi' });
+      await deliver({ from: '274839201847362@lid', body: 'hello' });
       check('an allowlist set does not stop the capture', () =>
         assert.strictEqual(seen.length, 0)
       );
     });
-    check('a sender missing from the allowlist is still logged', () =>
-      assert.ok(withList.some((l) => l === '[capture] 183765432109876@lid'))
+    check('a sender on the allowlist is logged as allowed', () =>
+      assert.ok(withList.includes('[capture] 183765432109876@lid allowed'), JSON.stringify(withList))
+    );
+    check('a sender missing from it is logged, and says so', () =>
+      assert.ok(withList.includes('[capture] 274839201847362@lid not allowed'))
     );
 
     const groups = await capturingLogs(async () => {
@@ -765,6 +1201,380 @@ async function main() {
     const { seen: after, deliver: deliverAfter } = bootRunner({ CAPTURE_IDS: 'false' });
     await deliverAfter({ from: '183765432109876@lid', body: 'hi' });
     check('turning capture off restores replies', () => assert.strictEqual(after.length, 1));
+  });
+
+  await section('phone numbers resolved to WhatsApp IDs', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatllama-ids-'));
+    let n = 0;
+    const cacheFile = () => path.join(dir, `cache-${++n}.json`);
+
+    // Sets the lookup table up before ready, which is when resolution runs.
+    const boot = async (env, lookups) => {
+      const r = bootRunner({ CONTACT_RESOLVE_DELAY_MS: '0', ...env });
+      r.client.lidLookups = lookups;
+      await r.client.emit('ready');
+      return r;
+    };
+
+    const LID = '183765432109876@lid';
+
+    const a = await boot(
+      { ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: cacheFile() },
+      { '447700900123@c.us': { lid: LID, pn: '447700900123@c.us' } }
+    );
+    await a.deliver({ from: LID, body: 'hello' });
+    check('a bare phone number matches the ID it resolves to', () =>
+      assert.strictEqual(a.seen.length, 1)
+    );
+
+    await a.deliver({ from: '999999999999@lid', body: 'hello' });
+    check('and nobody else gets in', () => assert.strictEqual(a.seen.length, 1));
+
+    check('the number is looked up one at a time', () =>
+      // The library wraps the batch in a single Promise.all inside the page, so
+      // one bad entry in an array would reject the whole call.
+      assert.ok(a.client.lidCalls.every((ids) => ids.length === 1), JSON.stringify(a.client.lidCalls))
+    );
+
+    const b = await boot(
+      { ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: cacheFile() },
+      { '447700900123@c.us': { lid: LID, pn: '447700900123@c.us' } }
+    );
+    await b.deliver({ from: '447700900123@c.us', body: 'hello' });
+    check('the phone-number form still matches, for contacts not yet migrated', () =>
+      assert.strictEqual(b.seen.length, 1)
+    );
+
+    const c = await boot(
+      { ALLOWED_CONTACTS: `${LID},447700900123`, CONTACT_CACHE_FILE: cacheFile() },
+      { '447700900123@c.us': { lid: '2222@lid' } }
+    );
+    check('an entry that is already an ID is never sent for lookup', () =>
+      assert.deepStrictEqual(c.client.lidCalls, [['447700900123@c.us']])
+    );
+    await c.deliver({ from: LID, body: 'hello' });
+    check('and is matched as written', () => assert.strictEqual(c.seen.length, 1));
+
+    // enforceLidAndPnRetrieval returns {} when the number is not on WhatsApp,
+    // so a call that succeeded can still carry nothing.
+    const empty = await capturingLogs(async () => {
+      const d = await boot(
+        { ALLOWED_CONTACTS: '447700900123,447700900999', CONTACT_CACHE_FILE: cacheFile() },
+        { '447700900123@c.us': { lid: LID } }
+      );
+      await d.deliver({ from: LID, body: 'hello' });
+      await d.deliver({ from: '999999999999@lid', body: 'hello' });
+      check('one number failing does not lock out the ones that worked', () =>
+        assert.strictEqual(d.seen.length, 1)
+      );
+    });
+    check('the number that could not be resolved is named at startup', () =>
+      assert.ok(empty.some((l) => l.includes('447700900999')), JSON.stringify(empty))
+    );
+
+    const thrown = await capturingLogs(async () => {
+      const e = await boot({ ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: cacheFile() }, () => {
+        throw new Error('page closed');
+      });
+      await e.deliver({ from: LID, body: 'hello' });
+      // The failure that matters. A broken lookup must never be read as an
+      // empty allowlist, which is the one that answers everybody.
+      check('a lookup that throws answers nobody rather than everybody', () =>
+        assert.strictEqual(e.seen.length, 0)
+      );
+    });
+    check('the failure is logged rather than swallowed', () =>
+      assert.ok(thrown.some((l) => l.includes('[contacts]')))
+    );
+
+    const shared = cacheFile();
+    const warm1 = await boot(
+      { ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: shared },
+      { '447700900123@c.us': { lid: LID } }
+    );
+    check('the resolved ID is written to the cache', () =>
+      assert.ok(fs.readFileSync(shared, 'utf8').includes(LID))
+    );
+
+    const warm2 = await boot({ ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: shared }, {});
+    check('a warm cache means no lookup at all next time', () =>
+      assert.deepStrictEqual(warm2.client.lidCalls, [])
+    );
+    await warm2.deliver({ from: LID, body: 'hello' });
+    check('and the cached ID still matches', () => assert.strictEqual(warm2.seen.length, 1));
+
+    // Backdated so the entry is stale and gets refreshed, but the refresh
+    // fails. Expiring it there would silence a contact that has worked for
+    // weeks because of one rate-limited lookup.
+    // Guarded, because a source that writes no cache leaves nothing to open and
+    // throwing here would take the whole differential run down. The two checks
+    // below then fail on their own, which is the point of running it.
+    try {
+      const stale = JSON.parse(fs.readFileSync(shared, 'utf8'));
+      stale.entries['447700900123'].at = 0;
+      fs.writeFileSync(shared, JSON.stringify(stale));
+    } catch {
+      // Nothing cached to backdate.
+    }
+
+    const refreshed = await boot(
+      { ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: shared },
+      {}
+    );
+    check('a stale entry is retried', () =>
+      assert.strictEqual(refreshed.client.lidCalls.length, 1)
+    );
+    await refreshed.deliver({ from: LID, body: 'hello' });
+    check('but a failed refresh never throws away what already worked', () =>
+      assert.strictEqual(refreshed.seen.length, 1)
+    );
+
+    const open = await boot({ CONTACT_CACHE_FILE: cacheFile() }, {});
+    await open.deliver({ from: 'anyone@lid', body: 'hello' });
+    check('an empty ALLOWED_CONTACTS still lets anyone write in', () =>
+      assert.strictEqual(open.seen.length, 1)
+    );
+    check('and looks nothing up', () => assert.deepStrictEqual(open.client.lidCalls, []));
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await section('the send endpoint', async () => {
+    const KEY = 'test-key-0123456789abcdef';
+    const HASH = crypto.createHash('sha512').update(KEY).digest('hex');
+
+    const boot = async (env = {}) => {
+      const r = bootRunner({
+        SEND_API_PORT: '0',
+        SEND_API_KEY_SHA512: HASH,
+        ALLOWED_CONTACTS: 'sam@lid',
+        ...env,
+      });
+      await r.client.emit('ready');
+      return r;
+    };
+
+    const call = (port, { method = 'POST', route = '/send', key = KEY, body = {} } = {}) =>
+      new Promise((resolve, reject) => {
+        const payload = typeof body === 'string' ? body : JSON.stringify(body);
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port,
+            method,
+            path: route,
+            headers: {
+              'content-type': 'application/json',
+              'content-length': Buffer.byteLength(payload),
+              ...(key ? { 'x-api-key': key } : {}),
+            },
+          },
+          (res) => {
+            let text = '';
+            res.on('data', (c) => (text += c));
+            res.on('end', () => resolve({ status: res.statusCode, text }));
+          }
+        );
+        req.on('error', reject);
+        req.end(payload);
+      });
+
+    /**
+     * Closes the listener whatever happens. main() sets process.exitCode rather
+     * than calling process.exit, so one socket left open would hang the suite
+     * for ever instead of failing it.
+     */
+    const withServer = async (r, label, fn) => {
+      if (!r.server) {
+        check(label, () => assert.fail('the endpoint did not start'));
+        return;
+      }
+      try {
+        const port = await new Promise((resolve, reject) => {
+          if (r.server.listening) return resolve(r.server.address().port);
+          r.server.once('listening', () => resolve(r.server.address().port));
+          r.server.once('error', reject);
+        });
+        await fn(port);
+      } finally {
+        await new Promise((res) => r.server.close(res));
+      }
+    };
+
+    const happy = await boot();
+    await withServer(happy, 'a correct key is accepted', async (port) => {
+      const res = await call(port, { body: { to: 'sam@lid', text: 'yes, 11 works' } });
+      await settle();
+      check('a correct key is accepted', () => assert.strictEqual(res.status, 202));
+      // 202 rather than 200: waiting for the queue would hold the request open
+      // behind whatever generation is already running.
+      check('the message goes out', () =>
+        assert.deepStrictEqual(happy.client.sent, [{ to: 'sam@lid', body: 'yes, 11 works' }])
+      );
+    });
+
+    const guarded = await boot();
+    await withServer(guarded, 'the key is checked', async (port) => {
+      const wrong = await call(port, { key: 'not-the-key', body: { to: 'sam@lid', text: 'hi' } });
+      const missing = await call(port, { key: null, body: { to: 'sam@lid', text: 'hi' } });
+      const short = await call(port, { key: 'zz', body: { to: 'sam@lid', text: 'hi' } });
+      await settle();
+      check('a wrong key is refused', () => assert.strictEqual(wrong.status, 401));
+      check('no key at all is refused', () => assert.strictEqual(missing.status, 401));
+      // Malformed hex decodes short, and comparing lengths first is what stops
+      // timingSafeEqual throwing on it.
+      check('a key that is not even hex-length is refused, not a crash', () =>
+        assert.strictEqual(short.status, 401)
+      );
+      check('and nothing was sent to anyone', () =>
+        assert.deepStrictEqual(guarded.client.sent, [])
+      );
+    });
+
+    const shaped = await boot();
+    await withServer(shaped, 'the request shape is checked', async (port) => {
+      const get = await call(port, { method: 'GET' });
+      const elsewhere = await call(port, { route: '/anything' });
+      const notJson = await call(port, { body: 'this is not json' });
+      const noText = await call(port, { body: { to: 'sam@lid' } });
+      const blank = await call(port, { body: { to: 'sam@lid', text: '   ' } });
+      check('GET is refused', () => assert.strictEqual(get.status, 405));
+      check('another path is not found', () => assert.strictEqual(elsewhere.status, 404));
+      check('a body that is not JSON is refused', () => assert.strictEqual(notJson.status, 400));
+      check('a missing text is refused', () => assert.strictEqual(noText.status, 400));
+      check('so is an empty one', () => assert.strictEqual(blank.status, 400));
+    });
+
+    const strangers = await boot();
+    await withServer(strangers, 'recipients are restricted', async (port) => {
+      const res = await call(port, { body: { to: 'stranger@lid', text: 'hello' } });
+      await settle();
+      // Without this, a leaked key can message anybody at all from your number
+      // rather than only the people the bot already talks to.
+      check('a recipient not on the allowlist is refused', () =>
+        assert.strictEqual(res.status, 403)
+      );
+      check('and nothing reaches them', () =>
+        assert.deepStrictEqual(strangers.client.sent, [])
+      );
+    });
+
+    const anyone = await boot({ SEND_API_ALLOW_ANY: 'true' });
+    await withServer(anyone, 'the restriction can be lifted', async (port) => {
+      const res = await call(port, { body: { to: 'stranger@lid', text: 'hello' } });
+      await settle();
+      check('SEND_API_ALLOW_ANY lifts the restriction deliberately', () =>
+        assert.strictEqual(res.status, 202)
+      );
+    });
+
+    const capped = await boot({ SEND_API_MAX_PER_MINUTE: '2' });
+    await withServer(capped, 'the endpoint is rate limited', async (port) => {
+      const body = { to: 'sam@lid', text: 'hi' };
+      await call(port, { body });
+      await call(port, { body });
+      const third = await call(port, { body });
+      await settle();
+      check('the endpoint has its own ceiling', () => assert.strictEqual(third.status, 429));
+      // The per-chat limiter would have texted the contact the rate-limit
+      // notice, which is nothing to do with them.
+      check('and hitting it does not text the contact anything', () =>
+        assert.strictEqual(capped.client.sent.length, 2)
+      );
+    });
+
+    const big = await boot();
+    await withServer(big, 'oversized bodies are refused', async (port) => {
+      const res = await call(port, {
+        body: JSON.stringify({ to: 'sam@lid', text: 'x'.repeat(200 * 1024) }),
+      });
+      check('a body over the cap is refused rather than buffered', () =>
+        assert.strictEqual(res.status, 413)
+      );
+    });
+
+    const noKey = await capturingLogs(async () => {
+      const r = bootRunner({ SEND_API_PORT: '0', SEND_API_KEY_SHA512: '' });
+      await r.client.emit('ready');
+      // A send endpoint reachable with no credential is a spam relay wired to a
+      // real phone number, so refusing to start is the only safe reading.
+      check('a port with no key does not start the endpoint at all', () =>
+        assert.strictEqual(r.server, null)
+      );
+    });
+    check('and says why', () =>
+      assert.ok(noKey.some((l) => l.includes('SEND_API_KEY_SHA512')), JSON.stringify(noKey))
+    );
+
+    const off = bootRunner({});
+    check('no port means no listener', () => assert.strictEqual(off.server, null));
+  });
+
+  await section('an approved reply replaces the one being written', async () => {
+    const KEY = 'test-key-0123456789abcdef';
+    resetModules({
+      REPLY_MODE: 'always',
+      AI_PREFIX_MODE: 'never',
+      SEND_API_PORT: '0',
+      SEND_API_KEY_SHA512: crypto.createHash('sha512').update(KEY).digest('hex'),
+    });
+    axiosStub = heldAxios();
+    require(srcFile('bots', 'assistant.js'));
+    const { run } = require(srcFile('lib', 'runner.js'));
+    const started = run(capturedBot);
+    const client = lastClient;
+    const ollama = axiosStub;
+
+    if (!started || !started.server) {
+      check('the endpoint started', () => assert.fail('no server was created'));
+    } else {
+      try {
+        const port = await new Promise((resolve) => {
+          if (started.server.listening) return resolve(started.server.address().port);
+          started.server.once('listening', () => resolve(started.server.address().port));
+        });
+
+        await client.emit('message', { from: 'sam@lid', timestamp: now(), body: 'you free sat' });
+        await settle();
+        check('the model is writing a reply', () => assert.strictEqual(ollama.prompts.length, 1));
+
+        await new Promise((resolve, reject) => {
+          const payload = JSON.stringify({ to: 'sam@lid', text: 'yeah 11 works, book it' });
+          const req = http.request(
+            {
+              host: '127.0.0.1',
+              port,
+              method: 'POST',
+              path: '/send',
+              headers: {
+                'content-type': 'application/json',
+                'content-length': Buffer.byteLength(payload),
+                'x-api-key': KEY,
+              },
+            },
+            (res) => {
+              res.resume();
+              res.on('end', resolve);
+            }
+          );
+          req.on('error', reject);
+          req.end(payload);
+        });
+        await wait(20);
+
+        check('the reply you approved is what gets sent', () =>
+          assert.deepStrictEqual(
+            client.sent.map((s) => s.body),
+            ['yeah 11 works, book it']
+          )
+        );
+        check('and the one being written is dropped, not queued behind it', () =>
+          assert.strictEqual(ollama.prompts.length, 1)
+        );
+      } finally {
+        await new Promise((res) => started.server.close(res));
+      }
+    }
   });
 
   await section('startup logging', async () => {
@@ -1085,7 +1895,12 @@ async function main() {
       '/api/generate': async (body) => ({
         data: {
           response: body.prompt.includes('Briefing:')
-            ? 'Sam wants to climb on Saturday. The booking is still yours to make.'
+            ? JSON.stringify({
+                urgency: 'today',
+                wants: 'Sam wants to climb on Saturday and the booking is still yours to make.',
+                deadline: '',
+                draft_reply: 'Saturday works for me.',
+              })
             : 'Sounds good.',
         },
       }),
@@ -1142,6 +1957,99 @@ async function main() {
     check('no webhook URL means no summary generation is attempted', () =>
       assert.strictEqual(axiosStub.posts().length, 1)
     );
+  });
+
+  await section('structured briefings', async () => {
+    // Runs one exchange, lets the conversation go idle, and hands back the
+    // briefing request and the notification it produced.
+    async function briefingFor(env, response) {
+      resetModules({
+        N8N_WEBHOOK_URL: 'http://stub-n8n/webhook/test',
+        WEBHOOK_IN_SIM: 'true',
+        SUMMARY_IDLE_MINUTES: '0.004',
+        ...env,
+      });
+      const sent = [];
+      axiosStub = makeAxios({
+        '/api/generate': async (body) => ({
+          data: { response: body.prompt.includes('Briefing:') ? response : 'Sounds good.' },
+        }),
+        'stub-n8n': async (body) => {
+          sent.push(body);
+          return { status: 200 };
+        },
+      });
+      require(srcFile('bots', 'assistant.js'));
+      await capturedBot.handle('c1', 'sam asked about the deposit', { isSim: true, from: null });
+      await wait(500);
+      return {
+        summary: sent.find((s) => s.event === 'conversation_summary'),
+        request: axiosStub.posts().find((p) => p.body?.prompt?.includes('Briefing:')).body,
+      };
+    }
+
+    const good = JSON.stringify({
+      urgency: 'now',
+      wants: 'Sam needs the deposit paid.',
+      deadline: 'Friday',
+      draft_reply: 'I will pay it tonight.',
+    });
+
+    let r = await briefingFor({}, good);
+    check('the briefing request carries the schema', () => assert.ok(r.request.format));
+    check('no stop sequences travel with a structured request', () =>
+      assert.strictEqual(r.request.options.stop, undefined)
+    );
+    check('the fields reach the webhook', () => {
+      assert.strictEqual(r.summary.triage.urgency, 'now');
+      assert.strictEqual(r.summary.triage.draftReply, 'I will pay it tonight.');
+    });
+    check('summary stays a readable string alongside them', () =>
+      assert.ok(r.summary.summary.includes('deposit'))
+    );
+
+    r = await briefingFor({}, `Here you go:\n\`\`\`json\n${good}\n\`\`\``);
+    check('an object wrapped in prose is still read', () =>
+      assert.strictEqual(r.summary.triage.urgency, 'now')
+    );
+
+    r = await briefingFor(
+      {},
+      JSON.stringify({ urgency: 'IMMEDIATELY', wants: 'x', deadline: '', draft_reply: '' })
+    );
+    check('an urgency the model invented is coerced to one n8n can route', () =>
+      assert.strictEqual(r.summary.triage.urgency, 'whenever')
+    );
+
+    let bad;
+    const logs = await capturingLogs(async () => {
+      bad = await briefingFor({}, 'not json at all, just a sentence about the booking');
+    });
+    check('a briefing that is not JSON still reaches the webhook', () =>
+      assert.ok(bad.summary.summary.includes('booking'))
+    );
+    check('and reports no fields rather than pretending it parsed', () => {
+      assert.strictEqual(bad.summary.triage, null);
+      assert.ok(logs.some((l) => l.includes('did not come back as JSON')));
+    });
+
+    r = await briefingFor({ SUMMARY_FORMAT: 'prose' }, 'Sam wants the deposit paid by Friday.');
+    check('prose mode sends no schema and keeps its stop sequences', () => {
+      assert.strictEqual(r.request.format, undefined);
+      assert.ok(r.request.options.stop.includes('User:'));
+    });
+    check('prose mode reports no fields at all', () =>
+      assert.strictEqual(r.summary.triage, null)
+    );
+
+    r = await briefingFor({ SUMMARY_MODEL: 'bigger:70b' }, good);
+    check('SUMMARY_MODEL changes the briefing model and nothing else', () => {
+      assert.strictEqual(r.request.model, 'bigger:70b');
+      const reply = axiosStub
+        .posts()
+        .find((p) => p.body?.prompt && !p.body.prompt.includes('Briefing:'));
+      assert.strictEqual(reply.body.model, 'llama3.1:8b');
+    });
   });
 
   const failed = results.filter(([ok]) => !ok).length;
