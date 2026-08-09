@@ -550,6 +550,7 @@ with comments.
 | `SUMMARY_MAX_MESSAGES` | Summarise anyway at this many exchanges, default 15 |
 | `SUMMARY_FORMAT` | `json` for fields n8n can branch on, or `prose`, default `json` |
 | `SUMMARY_MODEL` | A better model for the briefing, empty uses `ASSISTANT_MODEL` |
+| `SUMMARY_TIMEOUT_MS` | How long a briefing may take, default 300000. Separate from the reply budget |
 | `SEND_API_PORT` | Starts the send endpoint, empty disables it |
 | `SEND_API_HOST` | What it binds to, default `127.0.0.1` |
 | `SEND_API_KEY_SHA512` | SHA-512 of the key, without which it refuses to start |
@@ -707,6 +708,19 @@ conversation still in progress has not produced one yet. Check the `[digest]`
 line at startup, and look for `[digest] <id>: n exchange(s)` in the log when a
 conversation ends. Summaries are also skipped entirely when there is no webhook
 URL, since there would be nowhere to send them.
+
+**`[digest] summary generation failed: timeout`, while replies are fine.** The
+briefing is the slower of the two jobs even though it looks smaller. A schema
+constrains every token it writes, and by the time it runs the conversation has
+been idle for `SUMMARY_IDLE_MINUTES`, which on the default of 10 is past
+Ollama's own five-minute `keep_alive`, so the model has been unloaded and the
+call pays to load it back off disk before generating anything.
+
+Point `SUMMARY_MODEL` at something small, since triage needs far less of a model
+than conversation does, and raise `SUMMARY_TIMEOUT_MS` if it is still tight.
+Raising `OLLAMA_TIMEOUT_MS` instead is the wrong lever: that one is how long
+somebody waits for a reply. `SUMMARY_FORMAT=prose` drops the schema altogether
+and is the fastest option, at the cost of the fields n8n branches on.
 
 **It asks for the QR code again.** The session in `.wwebjs_auth/` was removed,
 or `clientId` in `src/bots/assistant.js` changed. Scan once more.

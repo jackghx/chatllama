@@ -119,6 +119,7 @@ const CONFIG_ENV = [
   'SUMMARY_MAX_MESSAGES',
   'SUMMARY_FORMAT',
   'SUMMARY_MODEL',
+  'SUMMARY_TIMEOUT_MS',
   'SEND_API_PORT',
   'SEND_API_HOST',
   'SEND_API_KEY_SHA512',
@@ -151,8 +152,8 @@ function makeAxios(responses = {}) {
       calls.push({ method: 'get', url });
       return { data: { models: [{ name: 'stub-model' }] } };
     },
-    post(url, body) {
-      calls.push({ method: 'post', url, body });
+    post(url, body, config) {
+      calls.push({ method: 'post', url, body, config });
       for (const [match, fn] of Object.entries(responses)) {
         if (url.includes(match)) return fn(body);
       }
@@ -1997,9 +1998,14 @@ async function main() {
       require(srcFile('bots', 'assistant.js'));
       await capturedBot.handle('c1', 'sam asked about the deposit', { isSim: true, from: null });
       await wait(500);
+      const generations = axiosStub.posts().filter((p) => p.url.includes('/api/generate'));
+      const briefing = generations.find((p) => p.body?.prompt?.includes('Briefing:'));
+      const answer = generations.find((p) => !p.body?.prompt?.includes('Briefing:'));
       return {
         summary: sent.find((s) => s.event === 'conversation_summary'),
-        request: axiosStub.posts().find((p) => p.body?.prompt?.includes('Briefing:')).body,
+        request: briefing.body,
+        timeout: briefing.config && briefing.config.timeout,
+        replyTimeout: answer && answer.config && answer.config.timeout,
       };
     }
 
@@ -2012,6 +2018,13 @@ async function main() {
 
     let r = await briefingFor({}, good);
     check('the briefing request carries the schema', () => assert.ok(r.request.format));
+    // A schema constrains every token and the model has usually been unloaded
+    // by the time this runs, so the budget that suits somebody waiting on a
+    // reply is not the budget this needs.
+    check('the briefing waits longer than a reply anybody is sitting through', () => {
+      assert.strictEqual(r.replyTimeout, 120000);
+      assert.strictEqual(r.timeout, 300000);
+    });
     check('no stop sequences travel with a structured request', () =>
       assert.strictEqual(r.request.options.stop, undefined)
     );
@@ -2056,6 +2069,12 @@ async function main() {
     check('prose mode reports no fields at all', () =>
       assert.strictEqual(r.summary.triage, null)
     );
+
+    r = await briefingFor({ SUMMARY_TIMEOUT_MS: '20000', OLLAMA_TIMEOUT_MS: '9000' }, good);
+    check('the two budgets are set independently', () => {
+      assert.strictEqual(r.timeout, 20000);
+      assert.strictEqual(r.replyTimeout, 9000);
+    });
 
     r = await briefingFor({ SUMMARY_MODEL: 'bigger:70b' }, good);
     check('SUMMARY_MODEL changes the briefing model and nothing else', () => {

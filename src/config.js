@@ -137,6 +137,13 @@ module.exports = {
     // The briefing runs after the reply has gone, so it can afford a slower and
     // better model than the one answering. Empty uses the assistant's.
     model: process.env.SUMMARY_MODEL || '',
+
+    // Its own budget, and a much larger one. OLLAMA_TIMEOUT_MS governs a person
+    // sitting looking at their phone, so it has to stay short. Nobody is waiting
+    // on a briefing, and it is the slower job of the two: a schema constrains
+    // every token, and by the time it runs the conversation has usually been
+    // idle long enough for Ollama to have unloaded the model.
+    timeoutMs: num(process.env.SUMMARY_TIMEOUT_MS, 300000),
   },
 
   assistant: {

@@ -99,9 +99,31 @@ on n8n would hold up the reply to the person on their phone.
 
 ## n8n workflow
 
-1. **Webhook** node, method `POST`. Use the `/webhook-test/` URL while building,
-   which only listens while the editor is open and "Listen for test event" is
-   active. Switch to the `/webhook/` URL and activate the workflow once it works.
+1. **Webhook** node, method `POST`, and set **Path** to something you choose,
+   such as `chatllama`. The node then shows two URLs built from your own n8n
+   host:
+
+   ```
+   test        https://n8n.example.com/webhook-test/chatllama
+   production  https://n8n.example.com/webhook/chatllama
+   ```
+
+   The test URL only listens while the editor is open and "Listen for test
+   event" is active, and 404s the rest of the time. That is the single most
+   common reason a webhook appears not to work. Build against it, then switch to
+   the production URL and activate the workflow.
+
+   Whichever one you are using goes in `.env`, and the bot has to be restarted
+   to pick it up:
+
+   ```
+   N8N_WEBHOOK_URL=https://n8n.example.com/webhook-test/chatllama
+   ```
+
+   Startup then says `[webhook] logging on` rather than naming the variable. The
+   URL path is the only thing keeping strangers out of the workflow, so treat it
+   as a secret. Nothing is sent to authenticate, so turning on the Webhook
+   node's own **Authentication** option will stop the posts arriving.
 2. **Switch** node on `{{ $json.body.event }}`, one output per event name. Skip
    this if you only want summaries, and use an IF node instead.
 3. **Discord** node, connection type `Webhook`, operation `Send a Message`.

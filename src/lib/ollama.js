@@ -55,6 +55,7 @@ async function generate({
   format,
   options = {},
   think = ollama.think,
+  timeoutMs = ollama.timeoutMs,
   signal,
 }) {
   const body = { model, prompt, stream: false, options: { ...options } };
@@ -73,7 +74,7 @@ async function generate({
   let res;
   try {
     res = await axios.post(`${ollama.host}/api/generate`, body, {
-      timeout: ollama.timeoutMs,
+      timeout: timeoutMs,
       signal,
     });
   } catch (err) {

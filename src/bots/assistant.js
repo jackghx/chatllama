@@ -143,6 +143,7 @@ async function summarise(conversationId, { messages, meta, reason }) {
       // model inside the lines, and generate() drops them there in any case.
       stop: structured ? undefined : ['Transcript:', 'User:', `${LABEL}:`],
       format: structured ? TRIAGE_SCHEMA : undefined,
+      timeoutMs: summaryCfg.timeoutMs,
     });
   } catch (err) {
     // Still worth notifying: the transcript below carries the exchange itself.
