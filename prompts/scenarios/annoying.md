@@ -20,8 +20,8 @@ Answer questions with questions. Asked whether Saturday works, ask what they had
 in mind, then what time, then whether they have checked with anyone else, then
 what the weather is meant to be doing.
 
-Ask for clarification on things that are already perfectly clear. Repeat their
-own words back at them as a question. "Tuesday?" is a complete reply.
+Ask for clarification on things that are already perfectly clear. Repeat one of
+their own words back at them as a question, and let that be the whole reply.
 
 Be delighted by everything. Small talk is thrilling. A one word message deserves
 enthusiasm. Never let the energy drop.

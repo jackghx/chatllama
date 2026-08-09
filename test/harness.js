@@ -650,6 +650,14 @@ async function main() {
         ['2 days', 60 * 24 * 2, ''],
         ['1w on holiday', 60 * 24 * 7, 'on holiday'],
         ['2 weeks', 60 * 24 * 14, ''],
+        // Compound and decimal. These matched none of the shapes the first
+        // version expected, so they fell through to being the away message:
+        // no end date at all, and "2h30m" texted to people as the reason.
+        ['2h30m', 150, ''],
+        ['2h30m at the gym', 150, 'at the gym'],
+        ['1w2d', 60 * 24 * 9, ''],
+        ['2.5h', 150, ''],
+        ['1.5d driving', 60 * 36, 'driving'],
         ['at the gym', null, 'at the gym'],
         ['back tuesday', null, 'back tuesday'],
         ['', null, ''],
@@ -669,6 +677,10 @@ async function main() {
         ['6pm', '6pm'],
         ['30', '30'],
         ['10 seconds', '10 seconds'],
+        // Reads as an hour and a half to a person, and as nothing at all to a
+        // parser. Refused rather than guessed at either way round.
+        ['1h30', '1h30'],
+        ['2hsomething', '2hsomething'],
       ]) {
         const got = parseAway(input);
         check(`away ${JSON.stringify(input)} is refused rather than sent as text`, () =>
@@ -822,6 +834,77 @@ async function main() {
     );
     check('the state says off', () =>
       assert.strictEqual(started && started.runtime.mode, 'off')
+    );
+  });
+
+  // Only one reply per conversation was ever tracked, so once a second one had
+  // started the first was left running with nothing pointing at it. "off"
+  // cancelled the one it could see and the orphan sent anyway, which is the one
+  // thing off exists to prevent.
+  await section('off reaches every reply in flight, not just the newest', async () => {
+    resetModules({ REPLY_MODE: 'always', AI_PREFIX_MODE: 'never', MAX_INTERRUPTS: '0' });
+    axiosStub = heldAxios();
+    require(srcFile('bots', 'assistant.js'));
+    const { run } = require(srcFile('lib', 'runner.js'));
+    const started = run(capturedBot);
+    const client = lastClient;
+    const ollama = axiosStub;
+    await client.emit('ready');
+
+    // No interrupts allowed, so the second message cannot amend the first and
+    // starts a reply of its own while the first is still generating.
+    await client.emit('message', { from: 'sam@lid', timestamp: now(), body: 'you around' });
+    await settle();
+    await client.emit('message', { from: 'sam@lid', timestamp: now(), body: 'or not' });
+    await settle();
+
+    check('two replies are genuinely in flight for the one chat', () =>
+      assert.strictEqual(started.runtime.inFlight.size, 2)
+    );
+
+    await client.emit('message_create', {
+      fromMe: true,
+      to: 'me@c.us',
+      timestamp: now(),
+      id: { _serialized: 'own-1' },
+      body: '/ai off',
+    });
+    await wait(20);
+    ollama.finish('a reply that should never have been sent');
+    await wait(20);
+
+    check('neither of them reaches the contact', () =>
+      assert.strictEqual(client.sent.filter((s) => s.to === 'sam@lid').length, 0)
+    );
+    check('and nothing is left tracked as in flight', () =>
+      assert.strictEqual(started.runtime.inFlight.size, 0)
+    );
+  });
+
+  // restarts only counted aborts, and a reply waiting behind another chat has
+  // no controller to abort, so MAX_INTERRUPTS never advanced and one sender
+  // could fold an unlimited number of messages into a single prompt.
+  await section('a reply queued behind another chat still bounds its amendments', async () => {
+    resetModules({ REPLY_MODE: 'always', AI_PREFIX_MODE: 'never', MAX_INTERRUPTS: '3' });
+    axiosStub = heldAxios();
+    require(srcFile('bots', 'assistant.js'));
+    const { run } = require(srcFile('lib', 'runner.js'));
+    const started = run(capturedBot);
+    const client = lastClient;
+    await client.emit('ready');
+
+    // Chat A occupies the queue, so nothing for chat B ever starts generating.
+    await client.emit('message', { from: 'busy@lid', timestamp: now(), body: 'first' });
+    await settle();
+
+    for (let i = 0; i < 20; i += 1) {
+      await client.emit('message', { from: 'flood@lid', timestamp: now(), body: `line ${i}` });
+    }
+    await settle();
+
+    const held = started.runtime.writing.get('flood@lid');
+    check('the flood is capped at MAX_INTERRUPTS rather than absorbed whole', () =>
+      assert.ok(held && held.parts.length <= 4, `parts: ${held && held.parts.length}`)
     );
   });
 
@@ -1634,6 +1717,34 @@ async function main() {
       assert.strictEqual(refreshed.seen.length, 1)
     );
 
+    // The cache was seeded into the match set wholesale, so a number taken out
+    // of ALLOWED_CONTACTS went on being allowed until the file was deleted by
+    // hand, and the docs describe that file as a speed-up rather than as the
+    // thing holding the allowlist.
+    const revoked = cacheFile();
+    await boot(
+      { ALLOWED_CONTACTS: '447700900123,447700900456', CONTACT_CACHE_FILE: revoked },
+      {
+        '447700900123@c.us': { lid: LID },
+        '447700900456@c.us': { lid: '274839201847362@lid' },
+      }
+    );
+    const cut = await boot({ ALLOWED_CONTACTS: '447700900123', CONTACT_CACHE_FILE: revoked }, {});
+    await cut.deliver({ from: LID, body: 'still me' });
+    await cut.deliver({ from: '274839201847362@lid', body: 'taken off the list' });
+    check('taking a number out of ALLOWED_CONTACTS actually revokes it', () =>
+      assert.deepStrictEqual(cut.seen.map((s) => s.id), [LID])
+    );
+    check('and putting them back costs no fresh lookup', () => {
+      const back = new (require(srcFile('lib', 'identity.js')).Identity)({
+        entries: ['447700900123', '447700900456'],
+        cacheFile: revoked,
+        ttlDays: 30,
+        delayMs: 0,
+      });
+      assert.ok(back.allows('274839201847362@lid'));
+    });
+
     const open = await boot({ CONTACT_CACHE_FILE: cacheFile() }, {});
     await open.deliver({ from: 'anyone@lid', body: 'hello' });
     check('an empty ALLOWED_CONTACTS still lets anyone write in', () =>
@@ -1764,6 +1875,33 @@ async function main() {
       );
     });
 
+    // An empty allowlist means anyone may write in. Reading it the same way on
+    // the way out made SEND_API_ALLOW_ANY=false a no-op in the configuration
+    // most people start from, so a leaked key reached any number in the world.
+    const openList = await boot({ ALLOWED_CONTACTS: '' });
+    await withServer(openList, 'an empty allowlist does not open the endpoint', async (port) => {
+      const res = await call(port, { body: { to: 'stranger@lid', text: 'hello' } });
+      await settle();
+      check('an empty ALLOWED_CONTACTS refuses every recipient, it does not allow all', () =>
+        assert.strictEqual(res.status, 403)
+      );
+      check('and nothing goes out', () => assert.deepStrictEqual(openList.client.sent, []));
+    });
+
+    const grouped = await boot({ SEND_API_ALLOW_ANY: 'true' });
+    await withServer(grouped, 'groups are refused on the way out too', async (port) => {
+      const group = await call(port, { body: { to: '12345@g.us', text: 'hello all' } });
+      const status = await call(port, { body: { to: 'status@broadcast', text: 'hi' } });
+      await settle();
+      // classify() keeps the bot out of groups on the way in. ALLOW_ANY was
+      // otherwise enough to post to one on the way out.
+      check('a group is refused even with ALLOW_ANY set', () =>
+        assert.strictEqual(group.status, 403)
+      );
+      check('so is a status post', () => assert.strictEqual(status.status, 403));
+      check('and neither reaches anyone', () => assert.deepStrictEqual(grouped.client.sent, []));
+    });
+
     const anyone = await boot({ SEND_API_ALLOW_ANY: 'true' });
     await withServer(anyone, 'the restriction can be lifted', async (port) => {
       const res = await call(port, { body: { to: 'stranger@lid', text: 'hello' } });
@@ -1822,6 +1960,10 @@ async function main() {
       AI_PREFIX_MODE: 'never',
       SEND_API_PORT: '0',
       SEND_API_KEY_SHA512: crypto.createHash('sha512').update(KEY).digest('hex'),
+      // Named, because the endpoint will only write to somebody named. An
+      // empty list means anyone may write in, never that anyone may be
+      // written to.
+      ALLOWED_CONTACTS: 'sam@lid',
     });
     axiosStub = heldAxios();
     require(srcFile('bots', 'assistant.js'));
@@ -2373,6 +2515,179 @@ async function main() {
         .find((p) => p.body?.prompt && !p.body.prompt.includes('Briefing:'));
       assert.strictEqual(reply.body.model, 'llama3.1:8b');
     });
+  });
+
+  // The transcript is only "User:" and "Assistant:", so the briefing was asked
+  // who wanted what while being told nothing about who they were. The prompt
+  // then offered a worked example that used a name, and an 8B given a
+  // name-shaped example and no name used the example's name.
+  await section('the briefing is told who the conversation is with', async () => {
+    const boot = async (contact) => {
+      resetModules({
+        REPLY_MODE: 'always',
+        AI_PREFIX_MODE: 'never',
+        N8N_WEBHOOK_URL: 'http://stub-n8n/webhook/test',
+        SUMMARY_IDLE_MINUTES: '0.004',
+      });
+      const sent = [];
+      axiosStub = makeAxios({
+        '/api/generate': async () => ({ data: { response: 'ok' } }),
+        'stub-n8n': async (body) => {
+          sent.push(body);
+          return { status: 200 };
+        },
+      });
+      require(srcFile('bots', 'assistant.js'));
+      const { run } = require(srcFile('lib', 'runner.js'));
+      run(capturedBot);
+      const client = lastClient;
+      await client.emit('ready');
+      await client.emit('message', {
+        from: 'sam@lid',
+        timestamp: now(),
+        body: 'you around saturday',
+        ...(contact ? { getContact: async () => contact } : {}),
+      });
+      await settle();
+      await wait(500);
+      return { sent, prompts: axiosStub.posts().filter((p) => p.body && p.body.prompt) };
+    };
+
+    const named = await boot({ name: 'Sam Baker', pushname: 'sambaker' });
+    const brief = named.prompts.find((p) => p.body.prompt.includes('Briefing:'));
+    check('the name reaches the prompt the briefing is written from', () =>
+      assert.ok(brief && brief.body.prompt.includes('called Sam Baker'), brief && brief.body.prompt)
+    );
+    check('the saved name wins over their WhatsApp display name', () =>
+      assert.ok(brief && !brief.body.prompt.includes('sambaker'))
+    );
+
+    const summary = named.sent.find((s) => s.event === 'conversation_summary');
+    check('and travels to n8n, so a card can say who rather than show an ID', () =>
+      assert.strictEqual(summary && summary.name, 'Sam Baker')
+    );
+    check('alongside the ID, which anything already reading it still gets', () =>
+      assert.strictEqual(summary && summary.from, 'sam@lid')
+    );
+
+    const display = await boot({ name: '', pushname: 'sambaker' });
+    const fallback = display.prompts.find((p) => p.body.prompt.includes('Briefing:'));
+    check('an unsaved contact falls back to their display name', () =>
+      assert.ok(fallback && fallback.body.prompt.includes('called sambaker'))
+    );
+
+    // Nothing to go on is the honest case, and inventing a name for it was the
+    // original bug. It must not be filled with the ID either.
+    const unknown = await boot(null);
+    const bare = unknown.prompts.find((p) => p.body.prompt.includes('Briefing:'));
+    check('no name at all means the model is told nothing rather than guessing', () =>
+      assert.ok(bare && !bare.body.prompt.includes('called'), bare && bare.body.prompt)
+    );
+    check('and the ID is never passed off as a name', () =>
+      assert.ok(bare && !bare.body.prompt.includes('sam@lid'))
+    );
+  });
+
+  // observe() was called straight from the event handler while a reply was
+  // still generating on the queue, so the message that got no reply was written
+  // into the transcript above the one that came before it.
+  await section('an unanswered message is recorded in the order it arrived', async () => {
+    resetModules({
+      REPLY_MODE: 'auto',
+      AI_PREFIX_MODE: 'never',
+      FOLLOW_UP_MINUTES: '0',
+      AUTO_REPLY_TEXT: 'away from my phone',
+      AUTO_REPLY_GAP_MINUTES: '600',
+      N8N_WEBHOOK_URL: 'http://stub-n8n/webhook/test',
+      SUMMARY_IDLE_MINUTES: '0.004',
+    });
+
+    const sent = [];
+    let release = null;
+    axiosStub = {
+      calls: [],
+      posts: () => [],
+      async get() {
+        return { data: { models: [] } };
+      },
+      post(url, body) {
+        if (url.includes('stub-n8n')) {
+          sent.push(body);
+          return Promise.resolve({ status: 200 });
+        }
+        if (body.prompt.includes('Briefing:')) {
+          return Promise.resolve({ data: { response: 'a briefing' } });
+        }
+        return new Promise((resolve) => {
+          release = () => resolve({ data: { response: 'quarter past six' } });
+        });
+      },
+    };
+
+    require(srcFile('bots', 'assistant.js'));
+    const { run } = require(srcFile('lib', 'runner.js'));
+    run(capturedBot);
+    const client = lastClient;
+    await client.emit('ready');
+
+    const at = now();
+    await client.emit('message', { from: 'sam@lid', timestamp: at, body: '/ai when is the train' });
+    await settle();
+    // Gets no reply of its own: it is not prefixed, and the fixed reply is
+    // inside its gap. It is only ever recorded.
+    await client.emit('message', { from: 'sam@lid', timestamp: at, body: 'also thanks' });
+    await settle();
+
+    release();
+    await settle();
+    await wait(500);
+
+    const summary = sent.find((s) => s.event === 'conversation_summary');
+    const lines = (summary && summary.transcript) || [];
+    check('the earlier message is above the later one', () => {
+      const first = lines.findIndex((l) => l.includes('when is the train'));
+      const second = lines.findIndex((l) => l.includes('also thanks'));
+      assert.ok(first !== -1 && second !== -1, JSON.stringify(lines));
+      assert.ok(first < second, JSON.stringify(lines));
+    });
+    check('and the answer sits with the message it answered', () => {
+      const answer = lines.findIndex((l) => l.includes('quarter past six'));
+      const second = lines.findIndex((l) => l.includes('also thanks'));
+      assert.ok(answer !== -1 && answer < second, JSON.stringify(lines));
+    });
+  });
+
+  await section('the simulation can steer the bot as your own phone does', async () => {
+    resetModules({});
+    const { isCommand } = require(srcFile('lib', 'commands.js'));
+    for (const text of ['', 'status', 'off', 'on', 'back', 'away 2h', 'AWAY 30m at the gym']) {
+      check(`${JSON.stringify(text)} is taken as a command`, () => assert.ok(isCommand(text)));
+    }
+    for (const text of ['when is the train', 'what time is it', 'book the table']) {
+      check(`${JSON.stringify(text)} still reaches the model`, () => assert.ok(!isCommand(text)));
+    }
+    // Matching the first word only, which is what runCommand itself switches
+    // on. The simulation reading these differently from your own chat would be
+    // worse than either reading: it is the place you rehearse the real thing.
+    for (const text of ['status of my order', 'on tuesday']) {
+      check(`${JSON.stringify(text)} is a command here exactly as it is on your phone`, () =>
+        assert.ok(isCommand(text))
+      );
+    }
+  });
+
+  // The prompt itself must not hand the model a name to copy.
+  await section('the briefing prompt supplies no name of its own', async () => {
+    resetModules({});
+    const { loadTriagePrompt, loadSummaryPrompt } = require(srcFile('lib', 'prompt.js'));
+    for (const [label, text] of [
+      ['triage', loadTriagePrompt()],
+      ['summary', loadSummaryPrompt()],
+    ]) {
+      check(`the ${label} prompt names nobody`, () =>
+        assert.ok(!/\b(Sam|Jack|Alex|Chris)\b/.test(text), text.slice(0, 400))
+      );
+    }
   });
 
   const failed = results.filter(([ok]) => !ok).length;

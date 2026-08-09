@@ -34,15 +34,28 @@ function loadSystemPrompt() {
   };
 }
 
+/**
+ * The bundled briefing prompts, which are read at require time.
+ *
+ * They are shipped with the repo, so a failure here means a damaged checkout
+ * rather than a bad setting. Throwing would still be the wrong answer: it kills
+ * the process during module load, before the client exists, and this runs
+ * unattended under pm2 where not starting means missed messages. Briefings are
+ * worth degrading; answering people is not.
+ */
+function loadBundled(file, label) {
+  try {
+    return stripComments(fs.readFileSync(file, 'utf8')).trim();
+  } catch (err) {
+    console.error(`[prompt] the ${label} prompt could not be read: ${err.message}`);
+    return '';
+  }
+}
+
 // No environment override. These shape a machine-readable briefing rather than
 // a persona, so they are edited in place on the rare occasion they need to be.
 // summary.md is the prose briefing, triage.md the structured one.
-function loadSummaryPrompt() {
-  return stripComments(fs.readFileSync(SUMMARY_FILE, 'utf8')).trim();
-}
-
-function loadTriagePrompt() {
-  return stripComments(fs.readFileSync(TRIAGE_FILE, 'utf8')).trim();
-}
+const loadSummaryPrompt = () => loadBundled(SUMMARY_FILE, 'prose briefing');
+const loadTriagePrompt = () => loadBundled(TRIAGE_FILE, 'structured briefing');
 
 module.exports = { loadSystemPrompt, loadSummaryPrompt, loadTriagePrompt };

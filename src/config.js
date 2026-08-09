@@ -16,6 +16,17 @@ const num = (v, fallback) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+// Unset is off. Anything else has to be a real port, because server.listen
+// throws synchronously on a bad one, before the WhatsApp client is even
+// created, and pm2 then burns its restart budget on a typo.
+const port = (v) => {
+  if (v === undefined || String(v).trim() === '') return null;
+  const n = Number(v);
+  if (Number.isInteger(n) && n >= 0 && n <= 65535) return n;
+  console.error(`[config] SEND_API_PORT is not a port number: "${v}". The endpoint is off.`);
+  return null;
+};
+
 const list = (v) =>
   String(v || '')
     .split(',')
@@ -74,7 +85,7 @@ module.exports = {
     // again. 0 turns it off and makes the prefix required every time.
     followUpMinutes: num(process.env.FOLLOW_UP_MINUTES, 15),
 
-    // The floor under that, so somebody messaging just outside the gap all day
+    // The daily cap on top of that, so somebody messaging just outside the gap
     // is not texted every hour. 0 removes it.
     autoReplyMaxPerDay: num(process.env.AUTO_REPLY_MAX_PER_DAY, 3),
 
@@ -126,10 +137,7 @@ module.exports = {
     // Unset means off. The port is the switch, so there is no separate flag to
     // leave on by accident. 0 binds whatever is free, which is only useful in
     // tests.
-    port:
-      process.env.SEND_API_PORT === undefined || String(process.env.SEND_API_PORT).trim() === ''
-        ? null
-        : num(process.env.SEND_API_PORT, null),
+    port: port(process.env.SEND_API_PORT),
     host: process.env.SEND_API_HOST || '127.0.0.1',
     // The digest, not the key, so a copy of .env is not a working credential.
     keyHash: (process.env.SEND_API_KEY_SHA512 || '').trim().toLowerCase(),

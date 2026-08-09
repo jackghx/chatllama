@@ -27,10 +27,15 @@ conversation.
 - `whenever` covers everything else, including anything already dealt with and
   anything that only passes on information. Most conversations are this.
 
-**wants** is one sentence on what the other person actually wanted, naming them
-if the transcript does. Write it so the owner can understand it without opening
-anything else. If they wanted nothing, say what they passed on instead. It is
-about the other person, so start from them: "Sam wants...", not "the owner to".
+**wants** is one sentence on what the other person actually wanted. Write it so
+the owner can understand it without opening anything else. If they wanted
+nothing, say what they passed on instead. It is about the other person, so start
+from them and what they want, rather than from the owner and what they are being
+asked to do.
+
+Use their name if you have been given one on the line above the transcript, or
+if they gave it themselves. If neither, call them "they". Do not reach for a
+name that is not there.
 
 **deadline** is the point after which a reply is late: a date, a time, or a
 phrase like "before Friday". Use only what was actually said. Leave it empty if

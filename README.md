@@ -97,9 +97,14 @@ and accounts do get banned for it. Use a number you can afford to lose. See
 ### 1. Get Ollama running
 
 ```bash
+curl -fsSL https://ollama.com/install.sh | sh
 ollama pull llama3.1:8b
-ollama serve
 ```
+
+The installer starts Ollama under systemd, so it is already listening and the
+pull has something to talk to. Run `ollama serve` yourself only if it is not:
+started by hand it holds the terminal for as long as it runs, and started twice
+it fails with "address already in use".
 
 Any model works. Whatever you pull must match `ASSISTANT_MODEL` in your `.env`.
 An 8B model on CPU takes long enough that replies feel like someone typing,
@@ -109,9 +114,20 @@ which for this is no bad thing. Time it yourself in step 5 before deciding.
 
 ```bash
 git clone https://github.com/jackghx/chatllama
-cd ChatLlama
+cd chatllama
 npm install
 cp .env.example .env
+```
+
+WhatsApp is driven through a real Chromium, which npm installs but Debian does
+not give the system libraries for. On a fresh install it dies at step 6 with
+"Failed to launch the browser process". Get them in now:
+
+```bash
+sudo apt install -y fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+  libcairo2 libcups2 libdbus-1-3 libdrm2 libexpat1 libgbm1 libglib2.0-0 \
+  libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+  libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 xdg-utils
 ```
 
 ### 3. Point it at Ollama
@@ -188,6 +204,14 @@ This runs the assistant against your terminal with no WhatsApp connection. Type
 messages as if you were the other person. Go back and edit the prompt until the
 replies sound like something you would be happy to have sent in your name.
 
+On the default `auto` mode a plain message gets `AUTO_REPLY_TEXT` and never
+reaches the model, which is the whole point of that mode but no use for hearing
+a persona. Start your lines with `/ai` to reach it, or run the session on
+`REPLY_MODE=always npm run assistant:sim` to hear it answer everything.
+
+The owner commands work here too, so `/ai away 2h at the gym` and `/ai status`
+are worth trying before you rely on them from your phone.
+
 ### 6. Connect WhatsApp
 
 ```bash
@@ -200,15 +224,17 @@ session is cached in `.wwebjs_auth/`, so you only do this once.
 A healthy start looks like this:
 
 ```
-[assistant] ready, reply mode: always
+[assistant] ready, reply mode: auto
+[commands] /ai from your own chat only, 447700900123@c.us and 1234567890@lid
 [prompt] loaded from SYSTEM_PROMPT_FILE /home/you/persona.md
 [notice] "[AI]", mode always
-[webhook] logging off, N8N_WEBHOOK_URL is empty
 [digest] every 10 quiet minutes, or 15 exchanges
+[briefing] json
+[webhook] logging off, N8N_WEBHOOK_URL is empty
 [ollama] reachable. models: llama3.1:8b
-[access] ALLOWED_CONTACTS is empty and REPLY_MODE is always, so every message
-         from anyone who has this number, including people not in your
-         contacts, gets an automated reply.
+[access] ALLOWED_CONTACTS is empty and REPLY_MODE is auto, so anyone who
+         messages this account gets the fixed reply, and anyone using /ai gets
+         an answer from the model.
 ```
 
 Read those lines. Each one is there because getting it wrong is otherwise
@@ -351,7 +377,7 @@ to them and gets a passable impression of you back.
 | --- | --- |
 | `auto` | A fixed reply to everything, and the model only on `COMMAND_PREFIX`. The default. |
 | `always` | The model replies to every message that passes the filters. |
-| `prefix` | The model replies only to `COMMAND_PREFIX`, and everything else is ignored. |
+| `prefix` | The model replies to `COMMAND_PREFIX`, and to follow-ups inside `FOLLOW_UP_MINUTES`. Everything else is ignored, and not recorded either. |
 | `off` | Nothing is answered at all. |
 
 `auto` is the one to run. The fixed reply is instant, so nobody waits eight
@@ -369,8 +395,8 @@ unless somebody asks for it by name.
 The fixed reply is sent once per fresh burst of contact, not once per message.
 The gap is measured from the last time that person wrote, so five messages in a
 row get one reply, and somebody coming back tomorrow gets another.
-`AUTO_REPLY_GAP_MINUTES` sets it, and `AUTO_REPLY_MAX_PER_DAY` is a floor under
-it so a slow trickle of messages cannot text somebody every hour all day.
+`AUTO_REPLY_GAP_MINUTES` sets it, and `AUTO_REPLY_MAX_PER_DAY` caps the day so
+a slow trickle of messages cannot text somebody every hour all day.
 
 ### The prefix is only needed once
 
@@ -404,10 +430,10 @@ n8n, no restart.
 
 | Command | Effect |
 | --- | --- |
-| `/ai status` | What mode it is in, what the fixed reply says, how many contacts are allowed |
-| `/ai off` | Answers nothing, and drops any reply it was in the middle of writing |
-| `/ai on` | Back to the configured `REPLY_MODE` |
-| `/ai away 2h in a meeting` | Fixed replies for two hours, using that wording instead of `AUTO_REPLY_TEXT` |
+| `/ai status` | What mode it is in, how much away time is left, what the fixed reply says if it is sending one, how many contacts are allowed |
+| `/ai off` | Answers nothing, and drops every reply it was in the middle of writing |
+| `/ai on` | Back to the configured `REPLY_MODE`, or `auto` if that is itself `off` |
+| `/ai away 2h in a meeting` | Fixed replies for two hours, with that wording under `AUTO_REPLY_TEXT` |
 | `/ai away` | The same with no end time, until you send `/ai back` |
 | `/ai back` | Clears away and returns to the configured mode |
 
@@ -420,6 +446,9 @@ Durations are a number and a unit, spelled however you like:
 | Days | `d`, `day`, `days` | `/ai away 3d in Berlin` |
 | Weeks | `w`, `wk`, `wks`, `week`, `weeks` | `/ai away 1w on holiday` |
 
+Units can be stacked and can take a decimal, so `/ai away 2h30m` and
+`/ai away 2.5h` are both two and a half hours.
+
 Months and years are not accepted, and neither are clock times or dates. There
 is no parsing of "until 6", because six is in the morning, in the evening, or
 tomorrow, in a timezone nobody stated, and getting it wrong means the bot
@@ -427,10 +456,15 @@ answers for you when you thought it had stopped. Anything longer than a couple
 of weeks is a change to `AUTO_REPLY_TEXT` rather than a temporary state, since
 away is held in memory and does not survive a restart.
 
-A duration it cannot read is refused rather than guessed at. `/ai away 2mo` or
-`/ai away 6pm` tells you what is valid and changes nothing, because the
-alternative is being away with no end date while people are texted the word
-"2mo".
+A duration it cannot read is refused rather than guessed at. `/ai away 2mo`,
+`/ai away 6pm` or `/ai away 1h30` tells you what is valid and changes nothing,
+because the alternative is being away with no end date while people are texted
+the word "2mo".
+
+None of this survives a restart. `off`, `on` and `away` live in memory, and pm2
+restarts on its own if the process runs out of memory, so a bot switched off
+overnight can be back in its configured mode by morning. For anything you need
+to hold, change `REPLY_MODE` or `AUTO_REPLY_TEXT` in `.env` and restart.
 
 Anything after the duration is the wording people get, sent underneath
 `AUTO_REPLY_TEXT` rather than instead of it:
@@ -479,12 +513,15 @@ Keep the key, put the digest in `.env`, and the key in whatever calls it:
 
 ```
 SEND_API_PORT=3111
-SEND_API_HOST=0.0.0.0
 SEND_API_KEY_SHA512=<the digest>
 ```
 
+`SEND_API_HOST` defaults to `127.0.0.1`, which is right whenever n8n runs on the
+same box. Widen it to `0.0.0.0` only if n8n is somewhere else on the LAN, and
+never put it behind a port forward.
+
 ```bash
-curl -X POST http://192.168.0.50:3111/send \
+curl -X POST http://127.0.0.1:3111/send \
   -H 'x-api-key: <the key>' -H 'content-type: application/json' \
   -d '{"to":"183765432109876@lid","text":"yeah 11 works, book it"}'
 ```
@@ -494,11 +531,16 @@ out, since the queue can be sitting behind a two-minute generation. A message
 sent this way cancels whatever the model was writing for that conversation, so
 your reply replaces the machine's rather than arriving alongside it.
 
-It will not start without a key. An endpoint reachable on a LAN with no
-credential is a spam relay wired to a real phone number. It also only messages
-people already in `ALLOWED_CONTACTS` unless you set `SEND_API_ALLOW_ANY=true`,
-so a leaked key cannot message anybody at all from your number. Keep it off any
-port forward.
+It will not start without a key, or with one that is not a SHA-512 digest. An
+endpoint reachable on a LAN with no credential is a spam relay wired to a real
+phone number.
+
+It will only message a number you named in `ALLOWED_CONTACTS`, unless you set
+`SEND_API_ALLOW_ANY=true`. An empty `ALLOWED_CONTACTS` means anyone may write
+in; it does not mean anyone may be written to, so with the list empty and
+`SEND_API_ALLOW_ANY` off the endpoint refuses every recipient and says so at
+startup. That way a leaked key cannot message anybody at all from your number.
+Groups and status posts are refused either way. Keep it off any port forward.
 
 ## When someone corrects themselves
 
@@ -551,10 +593,16 @@ some things are filtered out before the model is ever called.
 **Group chats.** Ignored unless `ALLOW_GROUPS=true`. An auto replier in a group
 answers every member's every message. Status broadcasts are always ignored.
 
-**Runaway loops.** `MAX_REPLIES_PER_HOUR`, default 20, caps replies per
-conversation over a rolling hour, then pauses that conversation and logs it
-once. This is what stops two auto repliers, or this one and an out of office
-bot, from talking to each other all night. Zero disables it.
+**Runaway loops.** `MAX_REPLIES_PER_HOUR`, default 20, caps **model-written**
+replies per conversation over a rolling hour, then pauses that conversation and
+logs it once. Zero disables it.
+
+The fixed reply is not charged against it, and deliberately so: twenty "hello"s
+would otherwise use up the budget for a real `/ai` question, and the breach
+would send a canned message explaining that canned messages have paused. What
+bounds the fixed reply is `AUTO_REPLY_GAP_MINUTES` and `AUTO_REPLY_MAX_PER_DAY`,
+so those are the two that stop this and an out-of-office bot texting each other
+all night. Setting either to zero removes that guard.
 
 When the cap is reached the sender gets one message saying so. Without it the
 assistant stops mid-conversation and they are left wondering why. It goes out
@@ -576,12 +624,14 @@ with comments.
 
 | Variable | Purpose |
 | --- | --- |
-| `OLLAMA_HOST` | Base URL of the Ollama instance |
-| `ASSISTANT_MODEL` | Ollama model tag, must be one you have pulled |
+| `OLLAMA_HOST` | Base URL of the Ollama instance, default `http://127.0.0.1:11434` |
+| `OLLAMA_TIMEOUT_MS` | How long a reply may take, default 120000. Somebody is waiting on this one |
+| `ASSISTANT_MODEL` | Ollama model tag, must be one you have pulled, default `llama3.1:8b` |
+| `ASSISTANT_MEMORY_WINDOW` | Lines of history kept per conversation, default 20 |
 | `OLLAMA_THINK` | `false` turns reasoning off, empty leaves the field unsent |
 | `OLLAMA_KEEP_ALIVE` | How long Ollama holds the model loaded, e.g. `30m` or `-1`. Empty uses its default |
 | `SYSTEM_PROMPT_FILE` / `SYSTEM_PROMPT` | Persona, overriding the bundled default |
-| `AI_PREFIX` / `AI_PREFIX_MODE` | Wording and frequency of the marker |
+| `AI_PREFIX` / `AI_PREFIX_MODE` | Wording and frequency of the marker, default `[AI]` and `always` |
 | `REPLY_MODE` | `auto`, `always`, `prefix` or `off`, default `auto` |
 | `COMMAND_PREFIX` | What someone sends to reach the model, default `/ai` |
 | `AUTO_REPLY_TEXT` | The fixed reply in `auto` mode, empty sends nothing |
@@ -596,13 +646,13 @@ with comments.
 | `OWNER_COMMANDS` | `off`, `self` or `any`, default `self` |
 | `OWNER_COMMAND_ACK` | Whether a command is confirmed back to you, default true |
 | `ALLOW_GROUPS` | Reply in group chats, default false |
-| `MAX_REPLIES_PER_HOUR` | Per-conversation cap, default 20, zero disables |
+| `MAX_REPLIES_PER_HOUR` | Per-conversation cap on model-written replies, default 20, zero disables |
 | `MAX_INTERRUPTS` | Restarts allowed when a sender adds to a reply in progress, default 3 |
 | `RATE_LIMIT_NOTICE` | Sent once when a conversation hits the cap, empty sends nothing |
-| `IGNORE_OLDER_THAN_SECONDS` | Drops the backlog replayed on connect |
+| `IGNORE_OLDER_THAN_SECONDS` | Drops the backlog replayed on connect, default 30 |
 | `N8N_WEBHOOK_URL` | Optional, empty disables webhook logging |
 | `WEBHOOK_IN_SIM` | Fire the webhook from terminal simulation too, default false |
-| `SUMMARY_IDLE_MINUTES` | Silence before a conversation is summarised, zero disables |
+| `SUMMARY_IDLE_MINUTES` | Silence before a conversation is summarised, default 10, zero disables |
 | `SUMMARY_MAX_MESSAGES` | Summarise anyway at this many exchanges, default 15 |
 | `SUMMARY_FORMAT` | `json` for fields n8n can branch on, or `prose`, default `json` |
 | `SUMMARY_MODEL` | A better model for the briefing, empty uses `ASSISTANT_MODEL` |
@@ -611,7 +661,7 @@ with comments.
 | `SEND_API_HOST` | What it binds to, default `127.0.0.1` |
 | `SEND_API_KEY_SHA512` | SHA-512 of the key, without which it refuses to start |
 | `SEND_API_MAX_PER_MINUTE` | Ceiling for the endpoint as a whole, default 30 |
-| `SEND_API_ALLOW_ANY` | Let it message people not on the allowlist, default false |
+| `SEND_API_ALLOW_ANY` | Let it message people not on the allowlist, default false. With it off and the allowlist empty, every recipient is refused |
 
 ## Upgrading to 3.0
 
@@ -628,8 +678,10 @@ with the model reachable on `/ai`. Set `REPLY_MODE=always` for exactly the old
 behaviour.
 
 Also worth knowing: `SUMMARY_FORMAT` defaults to `json`, so the summary webhook
-gains a `triage` object. Nothing is removed, `summary` is still the string it
-was, and `SUMMARY_FORMAT=prose` puts the old briefing back.
+gains a `triage` object and a `name`. No field is removed and `summary` is still
+a string, so a workflow reading it keeps working, but what it holds has changed:
+it is now `triage.wants` plus the deadline, rather than a briefing the model
+wrote as prose. `SUMMARY_FORMAT=prose` puts the old one back.
 
 `npm install` is needed. The minimum whatsapp-web.js is now 1.34.7, which is the
 version that can resolve a phone number to an identifier.
@@ -678,9 +730,10 @@ The summary carries a `triage` object, which is the part worth building on:
 {
   "event": "conversation_summary",
   "from": "183765432109876@lid",
+  "name": "Sam",
   "reason": "idle",
   "messages": 4,
-  "summary": "Sam wants to climb on Saturday. Needs an answer by Friday.",
+  "summary": "Sam wants to climb on Saturday, and the booking is still yours to make. Needs an answer by Friday.",
   "triage": {
     "urgency": "today",
     "wants": "Sam wants to climb on Saturday, and the booking is still yours to make.",
@@ -812,14 +865,17 @@ and qrcode-terminal, so it needs no WhatsApp session, no Ollama and no
 `npm install`. It exits non-zero on any failure. There is no test runner and no
 dev dependency.
 
-It covers the filters, both reply modes, contact ID capture, prompt source
-priority, the marker in all three modes, per-conversation memory, the summary
-debounce, and the webhook when n8n accepts a connection and never answers.
+It covers the filters, all four reply modes, the owner commands and away
+durations, contact ID capture and phone-number resolution, the send endpoint
+over a real socket, prompt source priority, the marker in all three modes,
+per-conversation memory, the summary debounce and structured briefings, and the
+webhook when n8n accepts a connection and never answers.
 
 `HARNESS_REPO=/path/to/other/checkout npm test` runs the same checks against a
 different copy of the repo, which is how you tell a suite that asserts something
-from one that only appears to. Run against the commit before contact capture was
-added, these fail 7 of 112, all of them in the section covering it.
+from one that only appears to. Every fix in here was written against it first:
+run the current suite at the commit before, and the checks covering that fix are
+the ones that fail.
 
 ## Notes from building this
 

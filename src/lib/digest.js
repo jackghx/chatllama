@@ -37,6 +37,19 @@ class Digest {
     state.timer = setTimeout(() => this.flush(id, 'idle'), this.idleMs).unref();
   }
 
+  /**
+   * Attaches a name learned after the conversation was first tracked.
+   *
+   * Looking a contact up costs a round trip into the browser, so it is started
+   * when they first write and lands a moment later. The briefing is written
+   * minutes after that, so waiting for the name at track() time would hold up a
+   * message for something only the notification needs.
+   */
+  rename(id, name) {
+    const state = this.pending.get(id);
+    if (state && name) state.meta = { ...state.meta, name };
+  }
+
   // Deleting first means a flush already under way cannot be started twice by
   // the timer and the shutdown handler racing each other.
   flush(id, reason) {

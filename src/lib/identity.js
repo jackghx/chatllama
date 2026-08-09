@@ -55,9 +55,27 @@ class Identity {
     // gap between connecting and resolving, and a warm cache is what stops
     // those being dropped, so it is load bearing rather than an optimisation.
     this.cached = this.readCache();
+    // Only for numbers still in the config. Seeding from the whole cache meant
+    // taking somebody out of ALLOWED_CONTACTS did not take them out of the
+    // allowlist: their lid was still cached, so it was still matched, and the
+    // cure was deleting a file the docs describe as a speed-up. Their row is
+    // left in place, so putting them back costs no lookup.
+    const wanted = new Set(this.numbers);
     for (const [number, row] of Object.entries(this.cached)) {
-      if (row && row.lid) this.matches.add(row.lid);
+      if (row && row.lid && wanted.has(number)) this.matches.add(row.lid);
     }
+  }
+
+  /**
+   * Whether this ID was named in the config, rather than merely not excluded.
+   *
+   * allows() answers "may this person write in", where an empty list means
+   * anyone. Sending is the other way round: an empty list has to mean nobody,
+   * or SEND_API_ALLOW_ANY=false protects nothing in the configuration most
+   * people start from, and a leaked key reaches any number in the world.
+   */
+  named(chatId) {
+    return this.matches.has(chatId);
   }
 
   /** No allowlist configured means anyone may write in. */

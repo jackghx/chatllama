@@ -39,7 +39,12 @@ class RuntimeState {
     // Conversations with a reply currently being written. Someone who corrects
     // themselves mid-sentence should get one answer to the whole thing, not an
     // answer to the half they have already taken back.
+    // The newest reply being written per conversation, which is what a further
+    // message amends. Not every reply in flight: see inFlight below.
     this.writing = new Map();
+    // All of them, including any left running after MAX_INTERRUPTS was reached
+    // and a second reply started. Cancelling has to reach these too.
+    this.inFlight = new Set();
 
     // Senders already printed in capture mode, so the log is a list to paste
     // rather than a running commentary.
@@ -181,13 +186,41 @@ class RuntimeState {
    * recorded on the entry and answer() stops when it sees it.
    */
   cancel(chatId, reason) {
-    const live = this.writing.get(chatId);
-    if (!live) return false;
+    let stopped = false;
 
-    live.cancelled = reason;
-    if (live.controller) live.controller.abort();
+    // Every reply in flight for this chat, not only the newest. Once a
+    // conversation has used up MAX_INTERRUPTS the next message starts a second
+    // reply, which overwrote the map entry and left the first one running with
+    // nothing pointing at it. "off" then cancelled the one it could see and the
+    // orphan carried on and sent, which is the one thing off has to prevent.
+    for (const state of this.inFlight) {
+      if (state.chatId !== chatId) continue;
+      state.cancelled = reason;
+      if (state.controller) state.controller.abort();
+      this.inFlight.delete(state);
+      stopped = true;
+    }
+
     this.writing.delete(chatId);
-    return true;
+    return stopped;
+  }
+
+  /** Every conversation with a reply in flight, for cancelling the lot. */
+  activeChats() {
+    return [...new Set([...this.inFlight].map((s) => s.chatId))];
+  }
+
+  noteWriting(chatId, state) {
+    state.chatId = chatId;
+    this.inFlight.add(state);
+    // The amendment target is the newest, so a later message folds into the
+    // reply being written now rather than into one already on its way out.
+    this.writing.set(chatId, state);
+  }
+
+  doneWriting(state) {
+    this.inFlight.delete(state);
+    if (this.writing.get(state.chatId) === state) this.writing.delete(state.chatId);
   }
 }
 

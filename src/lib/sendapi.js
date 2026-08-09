@@ -56,6 +56,18 @@ function startSendApi({ port, host, keyHash, maxPerMinute, allows, deliver }) {
     return null;
   }
 
+  // A SHA-512 is 128 hex characters. Anything else is a paste that lost its
+  // head or its tail, which fails closed on every request and presents as
+  // "n8n is broken" rather than as the typo it is.
+  if (!/^[0-9a-f]{128}$/i.test(String(keyHash).trim())) {
+    console.error(
+      '[send] SEND_API_KEY_SHA512 is not a SHA-512 digest, so the endpoint has ' +
+        'not been started. It should be 128 hex characters: ' +
+        'printf %s "$KEY" | sha512sum'
+    );
+    return null;
+  }
+
   // Global rather than per conversation. The per-chat limiter is a budget for
   // replies the model wrote unprompted; a reply you approved yourself should
   // never be refused because that conversation was busy, and refusing it there
@@ -74,7 +86,6 @@ function startSendApi({ port, host, keyHash, maxPerMinute, allows, deliver }) {
     if (!keyMatches(req.headers['x-api-key'], keyHash)) {
       return respond(res, 401, { error: 'bad or missing x-api-key' });
     }
-    if (!affordable()) return respond(res, 429, { error: 'too many sends' });
 
     let size = 0;
     let oversize = false;
@@ -86,7 +97,8 @@ function startSendApi({ port, host, keyHash, maxPerMinute, allows, deliver }) {
       if (size > MAX_BODY) {
         oversize = true;
         // Answered but not destroyed, so the response actually reaches the
-        // caller instead of racing a reset.
+        // caller instead of racing a reset. Chunks stop accumulating here, so
+        // the rest of the body is read and dropped rather than held.
         respond(res, 413, { error: 'body too large' });
         return;
       }
@@ -107,9 +119,20 @@ function startSendApi({ port, host, keyHash, maxPerMinute, allows, deliver }) {
       const text = String((payload && payload.text) || '');
       if (!to || !text.trim()) return respond(res, 400, { error: 'to and text are required' });
 
+      // classify() keeps the bot out of groups and off status posts on the way
+      // in. Nothing enforced that on the way out, so ALLOW_ANY was enough to
+      // post to a group regardless of ALLOW_GROUPS.
+      if (to.endsWith('@g.us') || to.endsWith('@broadcast')) {
+        return respond(res, 403, { error: 'one-to-one chats only' });
+      }
+
       // A leaked key would otherwise be able to message anybody at all from
       // your number, rather than only the people the bot already talks to.
       if (!allows(to)) return respond(res, 403, { error: 'not an allowed recipient' });
+
+      // Charged here rather than at the front door, so that malformed or
+      // refused requests cannot spend the budget a reply you approved needs.
+      if (!affordable()) return respond(res, 429, { error: 'too many sends' });
 
       deliver(to, text);
 

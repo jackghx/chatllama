@@ -41,6 +41,7 @@ yourself with.
   "event": "conversation_summary",
   "bot": "assistant",
   "from": "1234567890@lid",
+  "name": "Sam",
   "reason": "idle",
   "messages": 5,
   "summary": "Sam wants to climb at the Depot on Saturday around 11. Needs an answer by Friday.",
@@ -61,6 +62,12 @@ stopped with a summary still pending.
 
 `summary` is empty if the model could not be reached. `transcript` still holds
 the exchange, so the notification is worth sending either way.
+
+`name` is what you have that contact saved as, falling back to the display name
+they set themselves. Use it for the card title: `from` is an identifier and
+tells you nothing at a glance. It is an empty string when the account has
+neither, in which case fall back to `from`. The same name is given to the model
+writing the briefing, which is how `wants` can say who wanted it.
 
 ### The triage fields
 

@@ -51,6 +51,15 @@ function withNotice(answer, isFirstReply) {
 // when there is nowhere to send them.
 const reportable = (ctx) => Boolean(webhook.url) && (!ctx.isSim || webhook.fireInSim);
 
+// Who the conversation is with. The digest merges these across a conversation,
+// so a name that was not cached when the first message landed still reaches the
+// briefing, which is written minutes later.
+// The name is left off when there is not one yet rather than sent as an empty
+// string, because the digest merges these and an empty one would wipe a name
+// that a later lookup had already filled in.
+const who = (ctx) =>
+  ctx.name ? { from: ctx.from || 'simulation', name: ctx.name } : { from: ctx.from || 'simulation' };
+
 /**
  * What the briefing comes back as when SUMMARY_FORMAT is json. Ollama enforces
  * the shape, which is why the prompt only has to explain what each field means.
@@ -134,6 +143,11 @@ async function summarise(conversationId, { messages, meta, reason }) {
       prompt: [
         structured ? triagePrompt : summaryPrompt,
         '',
+        // The transcript is only "User:" and "Assistant:", so without this the
+        // model is asked who wants what while being told nobody's name. Given a
+        // name-shaped example and no name, it used the example. Omitted rather
+        // than filled with the ID when there is no name to give.
+        ...(meta.name ? [`The other person is called ${meta.name}.`, ''] : []),
         'Transcript:',
         ...history,
         '',
@@ -164,6 +178,9 @@ async function summarise(conversationId, { messages, meta, reason }) {
     event: 'conversation_summary',
     bot: 'assistant',
     from: meta.from || 'simulation',
+    // Whatever they are saved as, falling back to their WhatsApp display name.
+    // from is an ID, which is not something to read off a notification.
+    name: meta.name || '',
     reason,
     messages,
     summary: triage ? readable(triage) : raw,
@@ -197,7 +214,7 @@ const digest = new Digest({
  */
 function observe(conversationId, text, ctx) {
   memory.push(conversationId, `User: ${text}`);
-  if (reportable(ctx)) digest.track(conversationId, { from: ctx.from || 'simulation' });
+  if (reportable(ctx)) digest.track(conversationId, who(ctx));
 }
 
 /**
@@ -230,7 +247,7 @@ function auto(conversationId, text, ctx) {
       botReply: reply,
       automatic: true,
     });
-    digest.track(conversationId, { from: ctx.from || 'simulation' });
+    digest.track(conversationId, who(ctx));
   }
 
   return reply;
@@ -278,7 +295,7 @@ async function handle(conversationId, text, ctx) {
       botReply: reply,
       automatic: false,
     });
-    digest.track(conversationId, { from: ctx.from || 'simulation' });
+    digest.track(conversationId, who(ctx));
   }
 
   return reply;
@@ -300,6 +317,8 @@ run({
   handle,
   auto,
   observe,
+  // Who the conversation is with, once the runner has managed to look them up.
+  rename: (conversationId, name) => digest.rename(conversationId, name),
   // Pending summaries only exist in memory, so a restart would drop them.
   shutdown: () => digest.flushAll(),
 });

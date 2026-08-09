@@ -8,7 +8,7 @@ const { enabled: webhookEnabled } = require('./webhook');
 const { SerialQueue } = require('./queue');
 const { RateLimiter } = require('./ratelimit');
 const { RuntimeState } = require('./state');
-const { runCommand } = require('./commands');
+const { runCommand, isCommand } = require('./commands');
 const { Identity } = require('./identity');
 const { startSendApi, stopSendApi } = require('./sendapi');
 
@@ -383,6 +383,11 @@ function runWhatsApp(bot) {
         reply = await bot.handle(chatId, state.parts.join('\n'), {
           isSim: false,
           from: chatId,
+          // Read when the bot asks, not when this was queued, so a lookup that
+          // landed while the reply was being written is still used.
+          get name() {
+            return names.get(chatId) || '';
+          },
           signal: state.controller.signal,
         });
       } catch (err) {
@@ -434,6 +439,39 @@ function runWhatsApp(bot) {
     return false;
   }
 
+  /**
+   * What to call the person a chat is with.
+   *
+   * The transcript a briefing is written from is only "User:" and "Assistant:",
+   * so without this the model is asked what somebody wants while being told
+   * nothing about who they are, and an ID is no use on a notification either.
+   * Saved name first, since that is the one you would recognise.
+   *
+   * Looked up once and kept. The empty string is stored straight away so that a
+   * burst of messages starts one lookup rather than one each, and the answer is
+   * handed to the bot when it lands rather than awaited here, which would put a
+   * browser round trip in front of every reply.
+   */
+  const names = new Map();
+  function nameFor(msg, chatId) {
+    if (names.has(chatId)) return names.get(chatId);
+
+    names.set(chatId, '');
+    if (names.size > 500) names.delete(names.keys().next().value);
+
+    Promise.resolve(typeof msg.getContact === 'function' ? msg.getContact() : null)
+      .then((contact) => {
+        if (!contact) return;
+        const found = String(contact.name || contact.pushname || contact.shortName || '').trim();
+        if (!found || found === chatId) return;
+        names.set(chatId, found);
+        if (bot.rename) bot.rename(chatId, found);
+      })
+      .catch(() => {});
+
+    return '';
+  }
+
   client.on('message', (msg) => {
     const decision = classify(msg, runtime, { identity });
     const { chatId } = decision;
@@ -450,12 +488,24 @@ function runWhatsApp(bot) {
       return;
     }
 
+    // Started here for its side effect, not for what it returns. Every route
+    // out of this handler eventually wants the name, but the one that reaches
+    // the model builds its own context inside answer(), so leaving the lookup
+    // to whoever read it first meant it was never started at all.
+    nameFor(msg, chatId);
+
     const live = runtime.writing.get(chatId);
     // autoText so that "away 2h in a meeting" overrides the configured wording
     // without the bot having to read runtime state it does not own.
     const ctx = {
       isSim: false,
       from: chatId,
+      // A getter, so it is read when the bot uses it rather than now. The
+      // lookup is a round trip into the browser and has usually not come back
+      // yet at this point, and reading it here froze the empty string in.
+      get name() {
+        return names.get(chatId) || '';
+      },
       autoText: autoReply(runtime),
     };
 
@@ -474,7 +524,11 @@ function runWhatsApp(bot) {
       // than only the message that happened to earn a reply. Without this, a
       // conversation the fixed reply handled would reach you as silence.
       if (!due) {
-        if (bot.observe) bot.observe(chatId, decision.text, ctx);
+        // Through the queue, so it lands behind any reply still being written
+        // for this chat. Recording it here and now put the later message above
+        // the earlier one in the transcript, which both the model and the
+        // briefing then read in the wrong order.
+        if (bot.observe) queue.push(async () => bot.observe(chatId, decision.text, ctx));
         return;
       }
 
@@ -500,10 +554,12 @@ function runWhatsApp(bot) {
 
     if (amending) {
       live.parts.push(decision.text);
-      // No controller yet means the reply has not started, so the added line is
-      // already picked up and there is nothing to interrupt.
+      // Counted whether or not there is anything to interrupt. Only counting
+      // aborts meant a reply waiting behind another conversation had no
+      // controller yet, so MAX_INTERRUPTS never advanced and one sender could
+      // fold an unlimited number of messages into a single prompt.
+      live.restarts += 1;
       if (live.controller) {
-        live.restarts += 1;
         live.controller.abort();
         console.log(`[${bot.name}] .. ${chatId}: amended, writing it again`);
       }
@@ -511,13 +567,13 @@ function runWhatsApp(bot) {
     }
 
     const state = { parts: [decision.text], restarts: 0, controller: null, cancelled: null };
-    runtime.writing.set(chatId, state);
+    runtime.noteWriting(chatId, state);
 
     queue.push(async () => {
       try {
         await answer(chatId, state);
       } finally {
-        if (runtime.writing.get(chatId) === state) runtime.writing.delete(chatId);
+        runtime.doneWriting(state);
       }
     });
   });
@@ -547,7 +603,7 @@ function runWhatsApp(bot) {
 
     const reply = runCommand(runtime, decision.text, {
       cancelAll: (reason) => {
-        for (const chat of [...runtime.writing.keys()]) runtime.cancel(chat, reason);
+        for (const chat of runtime.activeChats()) runtime.cancel(chat, reason);
       },
     });
 
@@ -562,7 +618,11 @@ function runWhatsApp(bot) {
     host: sendCfg.host,
     keyHash: sendCfg.keyHash,
     maxPerMinute: sendCfg.maxPerMinute,
-    allows: (to) => sendCfg.allowAny || identity.allows(to),
+    // named(), not allows(). An empty ALLOWED_CONTACTS means anyone may write
+    // in, but it cannot also mean anyone may be written to: that turned
+    // SEND_API_ALLOW_ANY=false into a no-op in the configuration most people
+    // start from, so a leaked key could message any number in the world.
+    allows: (to) => sendCfg.allowAny || identity.named(to),
     deliver: (to, text) => {
       // A reply you approved replaces whatever the model was in the middle of
       // writing for that conversation, rather than arriving alongside it.
@@ -576,6 +636,15 @@ function runWhatsApp(bot) {
     },
   });
 
+  // Safe, but useless, and it would otherwise present as "n8n is broken".
+  if (server && !sendCfg.allowAny && identity.open) {
+    console.warn(
+      '[send] ALLOWED_CONTACTS is empty and SEND_API_ALLOW_ANY is false, so ' +
+        'every recipient will be refused. Put the numbers you want to reply to ' +
+        'in ALLOWED_CONTACTS.'
+    );
+  }
+
   installShutdown(bot, server ? [() => stopSendApi(server)] : []);
   client.initialize();
   return { client, runtime, identity, queue, server };
@@ -585,7 +654,10 @@ async function runSim(bot) {
   console.log(`--- ${bot.name}: terminal simulation, reply mode: ${access.replyMode} ---`);
   if (!(await preflight(bot))) process.exit(1);
   installShutdown(bot);
-  console.log('Type a message and press enter. Ctrl+C to exit.\n');
+  console.log(
+    `Type a message and press enter. ${access.commandPrefix} status, ` +
+      `${access.commandPrefix} away 2h and the rest work here too. Ctrl+C to exit.\n`
+  );
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const queue = new SerialQueue(bot.name);
@@ -609,13 +681,32 @@ async function runSim(bot) {
       const text = input.trim();
       if (!text) return ask();
 
-      const ctx = context();
+      // Before classify, because over WhatsApp a command is told apart by
+      // arriving from you, and the simulation has nobody to be. Without this
+      // every "/ai off" typed in here was quietly handed to the model as a
+      // question, so the one place to rehearse the away wording could not
+      // reach the away state at all.
+      const command = stripPrefix(text, access.commandPrefix);
+      if (access.ownerCommands !== 'off' && command !== null && isCommand(command)) {
+        const reply = runCommand(runtime, command, {
+          cancelAll: (reason) => {
+            for (const chat of runtime.activeChats()) runtime.cancel(chat, reason);
+          },
+        });
+        console.log(`${reply}\n`);
+        return ask();
+      }
 
       const decision = classify(
         { from: 'sim', body: text, timestamp: Math.floor(Date.now() / 1000) },
         runtime,
         { simulated: true }
       );
+
+      // After classify, not before. effectiveMode() is what notices that an
+      // away has lapsed and clears its wording, so reading the wording first
+      // sent one last stale reason after it had expired.
+      const ctx = context();
 
       if (decision.kind === 'ignore') {
         console.log(`(nothing sent: ${decision.reason})\n`);
