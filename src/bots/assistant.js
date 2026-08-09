@@ -1,6 +1,12 @@
 // Persona lives in prompts/assistant.md, SYSTEM_PROMPT or SYSTEM_PROMPT_FILE.
-const { assistant: cfg, summary: summaryCfg, webhook, access } = require('../config');
-const { generate } = require('../lib/ollama');
+const {
+  assistant: cfg,
+  summary: summaryCfg,
+  webhook,
+  access,
+  ollama: ollamaCfg,
+} = require('../config');
+const { generate, warmUp } = require('../lib/ollama');
 const { ConversationStore } = require('../lib/memory');
 const { Digest } = require('../lib/digest');
 const { SerialQueue } = require('../lib/queue');
@@ -37,6 +43,22 @@ function stripMarkers(raw) {
     }
   }
   return out.trim();
+}
+
+/**
+ * Cuts a reply back to its last finished sentence.
+ *
+ * Only ever used on a reply that actually reached ASSISTANT_MAX_TOKENS, which
+ * stops the model wherever the counter ran out rather than where the sentence
+ * ended. A long reply is a nuisance; one that stops mid-word looks broken, so
+ * the unfinished tail goes.
+ *
+ * Returns the text untouched when nothing in it finished, since a single
+ * unterminated sentence is still better than sending nothing at all.
+ */
+function trimToSentence(text) {
+  const end = Math.max(text.lastIndexOf('.'), text.lastIndexOf('!'), text.lastIndexOf('?'));
+  return end < 1 ? text : text.slice(0, end + 1).trim();
 }
 
 // Attached after generation. A model told to always emit a fixed string drops
@@ -156,6 +178,10 @@ async function summarise(conversationId, { messages, meta, reason }) {
       // Structured output needs no stop sequences: the schema is what keeps the
       // model inside the lines, and generate() drops them there in any case.
       stop: structured ? undefined : ['Transcript:', 'User:', `${LABEL}:`],
+      // Deliberately no token ceiling, unlike a reply. Nobody is waiting on a
+      // briefing, so there is nothing to save, and the schema already bounds
+      // it. Cutting a JSON document short leaves it unparseable, which would
+      // turn a briefing that was merely long into no briefing at all.
       format: structured ? TRIAGE_SCHEMA : undefined,
       timeoutMs: summaryCfg.timeoutMs,
     });
@@ -259,13 +285,21 @@ async function handle(conversationId, text, ctx) {
   const prompt = [systemPrompt, ...history, `User: ${text}`, `${LABEL}:`].join('\n');
 
   let raw;
+  let truncated = false;
   try {
     raw = await generate({
       model: cfg.model,
       prompt,
       // Without these the model writes the user's next message and answers it.
       stop: ['User:', '\nUser:', `\n${LABEL}:`],
+      // A ceiling rather than a target, so it costs nothing on a reply of the
+      // length the persona asks for and only bites on one that has run away.
+      // Somebody is waiting on this, and the wait tracks the token count.
+      options: cfg.maxTokens > 0 ? { num_predict: cfg.maxTokens } : {},
       signal: ctx.signal,
+      onMeta: (m) => {
+        truncated = m.truncated;
+      },
     });
   } catch (err) {
     // Not a failure: a newer message arrived and the runner is about to ask
@@ -275,10 +309,22 @@ async function handle(conversationId, text, ctx) {
     return withNotice('Something went wrong reaching the model. Try again shortly.', isFirstReply);
   }
 
-  const answer = stripMarkers(raw);
+  let answer = stripMarkers(raw);
   if (!answer) {
     console.error('[assistant] model returned an empty reply');
     return withNotice('I did not manage an answer there. Try asking again.', isFirstReply);
+  }
+
+  if (truncated) {
+    const tidied = trimToSentence(answer);
+    console.warn(
+      `[assistant] the reply reached ASSISTANT_MAX_TOKENS (${cfg.maxTokens})` +
+        (tidied === answer
+          ? ', and had no finished sentence to cut back to'
+          : ', so it was cut back to its last finished sentence') +
+        '. Raise it if this keeps happening with the persona you are using.'
+    );
+    answer = tidied;
   }
 
   memory.push(conversationId, `User: ${text}`);
@@ -317,6 +363,9 @@ run({
   handle,
   auto,
   observe,
+  // Left off entirely when it is switched off, so the runner has nothing to
+  // call rather than a function that quietly does nothing.
+  warm: ollamaCfg.warmup ? () => warmUp({ model: cfg.model }) : undefined,
   // Who the conversation is with, once the runner has managed to look them up.
   rename: (conversationId, name) => digest.rename(conversationId, name),
   // Pending summaries only exist in memory, so a restart would drop them.

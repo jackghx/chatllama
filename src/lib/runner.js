@@ -16,6 +16,18 @@ const { startSendApi, stopSendApi } = require('./sendapi');
 // kill_timeout, which ecosystem.config.js raises to sit above this.
 const SHUTDOWN_GRACE_MS = 10000;
 
+// WhatsApp drops the typing state on its own after roughly twenty-five seconds,
+// so it has to be sent again while a long generation is still running.
+const TYPING_REFRESH_MS = 20000;
+
+// A ceiling on the debounce, as a multiple of it. Somebody typing steadily
+// would otherwise defer their own answer for as long as they kept going.
+const MAX_DEBOUNCE_MULTIPLE = 3;
+
+// One model, however many people are writing in, so warming it for each of them
+// would be the same load requested over and over.
+const WARM_THROTTLE_MS = 60000;
+
 let shutdownInstalled = false;
 
 /**
@@ -112,6 +124,48 @@ function autoReply(runtime) {
   if (!reason) return fixed;
   if (!fixed) return reason;
   return `${fixed}\n\nReason: ${reason}`;
+}
+
+/**
+ * Shows "typing..." for as long as a reply is being written.
+ *
+ * Nothing here is any faster for it. A model that takes most of a minute reads
+ * as a number that has stopped working, and the identical wait with this on
+ * reads as somebody composing a message, which is the more honest of the two
+ * given that a message is in fact being composed.
+ *
+ * Every failure is swallowed on purpose. This is decoration, and a chat that
+ * cannot be fetched must never be the reason somebody loses their reply.
+ */
+function startTyping(client, chatId) {
+  if (!access.typingIndicator || typeof client.getChatById !== 'function') return () => {};
+
+  let chat = null;
+  let stopped = false;
+
+  const tick = async () => {
+    try {
+      if (!chat) chat = await client.getChatById(chatId);
+      if (stopped || !chat) return;
+      await chat.sendStateTyping();
+    } catch {
+      // Deliberately ignored. See above.
+    }
+  };
+
+  tick();
+  const timer = setInterval(tick, TYPING_REFRESH_MS).unref();
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    // Cleared even though sending a message clears it too, because a reply that
+    // was cancelled or dropped never sends one and would otherwise leave the
+    // chat showing "typing..." until WhatsApp timed it out.
+    Promise.resolve()
+      .then(() => chat && chat.clearState())
+      .catch(() => {});
+  };
 }
 
 function reportAccess() {
@@ -361,12 +415,60 @@ function runWhatsApp(bot) {
   }
 
   /**
+   * Holds a reply back until the sender has stopped adding to it.
+   *
+   * Interrupting a generation already under way works, but the seconds it had
+   * run are gone. Almost every interruption is somebody sending a question in
+   * two or three parts within a few seconds, which is a burst that can be
+   * waited out before anything has been spent at all.
+   *
+   * Returns false if the conversation was called off while waiting.
+   */
+  async function settleInput(chatId, state) {
+    const debounce = access.replyDebounceMs;
+    if (debounce <= 0) return !state.cancelled;
+
+    const deadline = Date.now() + debounce * MAX_DEBOUNCE_MULTIPLE;
+
+    state.debouncing = true;
+    try {
+      for (;;) {
+        const quiet = Date.now() - state.lastPart;
+        const left = Math.min(debounce - quiet, deadline - Date.now());
+        if (left <= 0) return true;
+
+        // unref, so a reply waiting out a burst is never the only thing holding
+        // the process open during a shutdown.
+        await new Promise((resolve) => setTimeout(resolve, left).unref());
+
+        if (state.cancelled) {
+          console.log(`[${bot.name}] .. ${chatId}: dropped while waiting, ${state.cancelled}`);
+          return false;
+        }
+      }
+    } finally {
+      state.debouncing = false;
+    }
+  }
+
+  /**
    * Writes one reply, starting again whenever a newer message is added.
    *
    * The abort lands inside generate(), so the discarded attempt costs only the
    * seconds it had already run, and nothing reaches memory or the sender.
    */
   async function answer(chatId, state) {
+    // Started before the debounce rather than after. They are mid-conversation
+    // from the moment their message lands, and the wait is part of the reply.
+    const stopTyping = startTyping(client, chatId);
+    try {
+      return await write(chatId, state);
+    } finally {
+      stopTyping();
+    }
+  }
+
+  async function write(chatId, state) {
     for (;;) {
       // Read here rather than trusted from the moment this was queued. A reply
       // can sit behind a long generation, and by the time it runs the
@@ -375,6 +477,11 @@ function runWhatsApp(bot) {
         console.log(`[${bot.name}] .. ${chatId}: dropped, ${state.cancelled}`);
         return;
       }
+
+      // Cleared before waiting, so that a message arriving during the debounce
+      // is not logged as having interrupted a generation that already finished.
+      state.controller = null;
+      if (!(await settleInput(chatId, state))) return;
 
       state.controller = new AbortController();
 
@@ -452,6 +559,35 @@ function runWhatsApp(bot) {
    * handed to the bot when it lands rather than awaited here, which would put a
    * browser round trip in front of every reply.
    */
+  /**
+   * Loads the model before anybody has asked it for anything.
+   *
+   * Called when the fixed reply goes out, which is the moment two things become
+   * true: somebody is at the other end right now, and they have just been told
+   * to use the prefix if they want a real answer. In auto mode the model is
+   * otherwise idle all day and Ollama has long since evicted it, so without
+   * this the first prefixed message pays to read the weights off disk with
+   * somebody watching. Here it is paid while they read the fixed reply.
+   *
+   * Never awaited, and its failures are a warning rather than an error. If the
+   * warm-up does not happen the next question is merely as slow as it used to
+   * be, which is not worth failing a reply over.
+   */
+  let lastWarm = 0;
+  function warmModel() {
+    // Only ever reached from the fixed-reply route, which classify has already
+    // decided is on, allowed and not a group, so there is nothing to re-check.
+    if (!bot.warm) return;
+
+    const at = Date.now();
+    if (at - lastWarm < WARM_THROTTLE_MS) return;
+    lastWarm = at;
+
+    Promise.resolve()
+      .then(() => bot.warm())
+      .catch((err) => console.warn('[ollama] warm-up failed:', err.message));
+  }
+
   const names = new Map();
   function nameFor(msg, chatId) {
     if (names.has(chatId)) return names.get(chatId);
@@ -520,6 +656,11 @@ function runWhatsApp(bot) {
     console.log(`[${bot.name}] <- ${chatId}: ${decision.text}`);
 
     if (decision.kind === 'auto') {
+      // Whether or not the fixed reply is due. Somebody writing in is the
+      // signal, and a conversation already inside the gap is one where the
+      // prefix is even likelier to turn up next.
+      warmModel();
+
       // Recorded either way, so the briefing covers everything they sent rather
       // than only the message that happened to earn a reply. Without this, a
       // conversation the fixed reply handled would reach you as silence.
@@ -554,11 +695,21 @@ function runWhatsApp(bot) {
 
     if (amending) {
       live.parts.push(decision.text);
+      // What the debounce measures from, so each new part restarts the wait.
+      live.lastPart = Date.now();
+
       // Counted whether or not there is anything to interrupt. Only counting
       // aborts meant a reply waiting behind another conversation had no
       // controller yet, so MAX_INTERRUPTS never advanced and one sender could
       // fold an unlimited number of messages into a single prompt.
-      live.restarts += 1;
+      //
+      // A message landing inside the debounce is the one exception: no
+      // generation has started, so nothing was thrown away and there is nothing
+      // to charge for. Charging it anyway would spend the entire interrupt
+      // budget on exactly the burst the debounce exists to absorb, and the
+      // fourth message of a burst would start a second reply of its own.
+      if (!live.debouncing) live.restarts += 1;
+
       if (live.controller) {
         live.controller.abort();
         console.log(`[${bot.name}] .. ${chatId}: amended, writing it again`);
@@ -566,7 +717,14 @@ function runWhatsApp(bot) {
       return;
     }
 
-    const state = { parts: [decision.text], restarts: 0, controller: null, cancelled: null };
+    const state = {
+      parts: [decision.text],
+      restarts: 0,
+      controller: null,
+      cancelled: null,
+      lastPart: Date.now(),
+      debouncing: false,
+    };
     runtime.noteWriting(chatId, state);
 
     queue.push(async () => {

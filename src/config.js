@@ -54,6 +54,16 @@ module.exports = {
     // disk before it can start. Sent per request rather than set on the server,
     // so this only pins the model this bot uses.
     keepAlive: (process.env.OLLAMA_KEEP_ALIVE || '').trim(),
+
+    // Loads the model before anybody has asked it for anything.
+    //
+    // auto mode leaves it idle nearly all day, because the fixed reply never
+    // touches it and briefings are rare, so Ollama evicts it and the first
+    // prefixed message of the afternoon pays to read the weights back off disk
+    // with somebody waiting on the other end. Warming when the fixed reply goes
+    // out moves that cost into the seconds they spend reading it, and the fixed
+    // reply is the message telling them to use the prefix in the first place.
+    warmup: bool(process.env.OLLAMA_WARMUP, true),
   },
 
   access: {
@@ -113,6 +123,21 @@ module.exports = {
     allowGroups: bool(process.env.ALLOW_GROUPS, false),
     maxRepliesPerHour: num(process.env.MAX_REPLIES_PER_HOUR, 20),
 
+    // How long a conversation has to be quiet before a reply is started.
+    //
+    // People send a question in two or three parts. Answering the first part
+    // the moment it lands means the generation is thrown away when the second
+    // arrives, and with MAX_INTERRUPTS at 3 one reply can cost four full
+    // generations. Waiting a couple of seconds first absorbs the burst before
+    // anything has been spent on it. Measured from their last message, so a
+    // question sent whole waits this once and no longer. 0 starts immediately.
+    replyDebounceMs: num(process.env.REPLY_DEBOUNCE_MS, 2000),
+
+    // Shows "typing..." while a reply is being written. It makes nothing
+    // faster. A minute of silence reads as a number that is broken, and the
+    // same minute with this on reads as somebody composing a message.
+    typingIndicator: bool(process.env.TYPING_INDICATOR, true),
+
     // How many times a reply may be thrown away and written again because the
     // sender added something. Zero answers each message separately.
     maxInterrupts: num(process.env.MAX_INTERRUPTS, 3),
@@ -170,6 +195,17 @@ module.exports = {
   assistant: {
     model: process.env.ASSISTANT_MODEL || 'llama3.1:8b',
     memoryWindow: num(process.env.ASSISTANT_MEMORY_WINDOW, 20),
+
+    // A ceiling on the reply, not a target.
+    //
+    // It changes nothing about how the model writes: same prompt, same
+    // sampling, same first hundred tokens. All it does is refuse to let a reply
+    // run on, and generation time is close to linear in tokens produced, so the
+    // only replies it costs anything are the ones that had already gone wrong.
+    // Well above what any of the bundled personas need, since they all ask for
+    // two short lines. A reply that does reach the ceiling is cut back to its
+    // last finished sentence rather than sent half written. 0 removes it.
+    maxTokens: num(process.env.ASSISTANT_MAX_TOKENS, 400),
 
     systemPromptFile: process.env.SYSTEM_PROMPT_FILE || '',
     systemPrompt: process.env.SYSTEM_PROMPT || '',

@@ -45,7 +45,16 @@ class ClientStub {
     // or a function, so a test can also make the lookup reject.
     this.lidLookups = null;
     this.lidCalls = [];
+    // The chat the typing indicator drives, when a test wants to watch it.
+    // Null is the ordinary case and stands in for a chat that cannot be
+    // fetched, which the indicator has to survive without costing a reply.
+    this.typingChat = null;
+    this.chatRequests = [];
     lastClient = this;
+  }
+  async getChatById(id) {
+    this.chatRequests.push(id);
+    return this.typingChat;
   }
   async getContactLidAndPhone(ids) {
     this.lidCalls.push(ids);
@@ -91,7 +100,10 @@ const CONFIG_ENV = [
   'OLLAMA_TIMEOUT_MS',
   'OLLAMA_THINK',
   'OLLAMA_KEEP_ALIVE',
+  'OLLAMA_WARMUP',
   'REPLY_MODE',
+  'REPLY_DEBOUNCE_MS',
+  'TYPING_INDICATOR',
   'COMMAND_PREFIX',
   'AUTO_REPLY_TEXT',
   'AUTO_REPLY_GAP_MINUTES',
@@ -111,6 +123,7 @@ const CONFIG_ENV = [
   'RATE_LIMIT_NOTICE',
   'ASSISTANT_MODEL',
   'ASSISTANT_MEMORY_WINDOW',
+  'ASSISTANT_MAX_TOKENS',
   'SYSTEM_PROMPT_FILE',
   'SYSTEM_PROMPT',
   'AI_PREFIX',
@@ -139,6 +152,12 @@ function resetModules(env = {}) {
   }
   for (const key of CONFIG_ENV) delete process.env[key];
   process.env.OLLAMA_HOST = 'http://stub:11434';
+  // Both ship on, and both are wrong as a default here. The debounce would add
+  // its wait to every reply in the suite, and the warm-up would put an extra
+  // POST in front of the assertions that count what reached the model. Assigned
+  // before env, so a scenario testing them can still turn them back on.
+  process.env.REPLY_DEBOUNCE_MS = '0';
+  process.env.OLLAMA_WARMUP = 'false';
   Object.assign(process.env, env);
   capturedBot = null;
   lastClient = null;
@@ -250,6 +269,7 @@ function bootRunner(env = {}, { pinMode = true } = {}) {
   const { run } = require(srcFile('lib', 'runner.js'));
   const seen = [];
   const observed = [];
+  const warmed = [];
   const started = run({
     name: 'test',
     clientId: 'test',
@@ -259,11 +279,16 @@ function bootRunner(env = {}, { pinMode = true } = {}) {
     },
     // No auto() on purpose, so the runner's own fallback is what gets exercised.
     observe: (id, text) => observed.push({ id, text }),
+    // Always present, unlike the real bot which leaves it off when the warm-up
+    // is disabled. What is under test here is when the runner decides to call
+    // it, which is a separate question from whether the assistant offers it.
+    warm: async () => warmed.push(Date.now()),
   });
   const client = lastClient;
   return {
     seen,
     observed,
+    warmed,
     client,
     runtime: started && started.runtime,
     server: started && started.server,
@@ -2688,6 +2713,244 @@ async function main() {
         assert.ok(!/\b(Sam|Jack|Alex|Chris)\b/.test(text), text.slice(0, 400))
       );
     }
+  });
+
+  await section('waiting for the sender to stop typing', async () => {
+    // Long enough that the whole burst lands inside it, short enough that the
+    // suite is not held up. The handler resolves at once, so this is the only
+    // thing standing between a message arriving and a reply being written.
+    const DEBOUNCE = 120;
+    const boot = () =>
+      bootRunner({ REPLY_MODE: 'always', REPLY_DEBOUNCE_MS: String(DEBOUNCE), MAX_INTERRUPTS: '3' });
+
+    const burst = boot();
+    await burst.deliver({ body: 'are you' });
+    await burst.deliver({ body: 'free on' });
+    await burst.deliver({ body: 'saturday' });
+    await wait(DEBOUNCE * 3);
+
+    check('a burst is answered once, with every part in the prompt', () => {
+      assert.strictEqual(burst.seen.length, 1, JSON.stringify(burst.seen));
+      assert.strictEqual(burst.seen[0].text, 'are you\nfree on\nsaturday');
+    });
+
+    // The interrupt budget is what stops one sender folding an unlimited number
+    // of messages into a single prompt, and it is spent on generations actually
+    // thrown away. Nothing starts during the debounce, so nothing is thrown
+    // away, and a burst longer than MAX_INTERRUPTS must still be one reply.
+    const long = boot();
+    for (const body of ['one', 'two', 'three', 'four', 'five']) {
+      await long.deliver({ body });
+    }
+    await wait(DEBOUNCE * 3);
+
+    check('a burst longer than MAX_INTERRUPTS does not spend the budget', () => {
+      assert.strictEqual(long.seen.length, 1, JSON.stringify(long.seen));
+      assert.strictEqual(long.seen[0].text, 'one\ntwo\nthree\nfour\nfive');
+    });
+
+    // Somebody typing steadily would otherwise defer their own answer for as
+    // long as they kept going, so the wait is capped at a multiple of itself.
+    const steady = bootRunner({
+      REPLY_MODE: 'always',
+      REPLY_DEBOUNCE_MS: String(DEBOUNCE),
+      MAX_INTERRUPTS: '20',
+    });
+    const until = Date.now() + DEBOUNCE * 5;
+    while (Date.now() < until) {
+      await steady.deliver({ body: 'still going' });
+      await wait(DEBOUNCE / 2);
+    }
+    await wait(DEBOUNCE * 4);
+
+    check('a sender who never pauses is still answered', () =>
+      assert.ok(steady.seen.length >= 1, 'nothing was ever generated')
+    );
+
+    const immediate = bootRunner({ REPLY_MODE: 'always', REPLY_DEBOUNCE_MS: '0' });
+    await immediate.deliver({ body: 'now please' });
+    check('0 starts the reply straight away', () =>
+      assert.strictEqual(immediate.seen.length, 1, JSON.stringify(immediate.seen))
+    );
+  });
+
+  await section('loading the model before it is asked for', async () => {
+    const warm = bootRunner({ REPLY_MODE: 'auto', AUTO_REPLY_TEXT: 'not here' });
+
+    await warm.deliver({ from: 'a@lid', body: 'hello' });
+    check('the fixed reply warms the model', () =>
+      assert.strictEqual(warm.warmed.length, 1, JSON.stringify(warm.warmed))
+    );
+
+    // One model however many people are writing in, so a second conversation
+    // starting seconds later is the same load asked for twice.
+    await warm.deliver({ from: 'b@lid', body: 'hello' });
+    check('a second conversation does not warm it again', () =>
+      assert.strictEqual(warm.warmed.length, 1, JSON.stringify(warm.warmed))
+    );
+
+    // Nothing can reach the model while it is off, so loading it is pure waste.
+    const off = bootRunner({ REPLY_MODE: 'off' });
+    await off.deliver({ body: 'hello' });
+    check('a bot that is switched off warms nothing', () =>
+      assert.strictEqual(off.warmed.length, 0)
+    );
+
+    // A warm-up that fails leaves the next question exactly as slow as it has
+    // always been, which is not worth failing somebody's reply over.
+    resetModules({ REPLY_MODE: 'auto', AUTO_REPLY_TEXT: 'not here' });
+    axiosStub = makeAxios();
+    const logs = await capturingLogs(async () => {
+      const { run } = require(srcFile('lib', 'runner.js'));
+      run({
+        name: 'test',
+        clientId: 'test',
+        handle: async () => 'ok',
+        warm: async () => {
+          throw new Error('ollama is down');
+        },
+      });
+      await lastClient.emit('message', { from: 'z@lid', timestamp: now(), body: 'hi' });
+      await settle();
+      await settle();
+    });
+    const afterFailure = lastClient.sent;
+    check('a failing warm-up is a warning, not a lost reply', () => {
+      assert.ok(
+        logs.some((l) => l.includes('warm-up failed') && l.includes('ollama is down')),
+        logs.join('\n')
+      );
+      assert.deepStrictEqual(
+        afterFailure.map((s) => s.body),
+        ['not here']
+      );
+    });
+
+    // The switch lives on the assistant, which leaves the method off entirely
+    // rather than handing the runner one that quietly does nothing.
+    resetModules({ OLLAMA_WARMUP: 'false' });
+    axiosStub = makeAxios();
+    require(srcFile('bots', 'assistant.js'));
+    const disabled = capturedBot;
+
+    resetModules({ OLLAMA_WARMUP: 'true' });
+    axiosStub = makeAxios(ollamaReplies('x'));
+    require(srcFile('bots', 'assistant.js'));
+    const enabled = capturedBot;
+
+    check('OLLAMA_WARMUP=false leaves the assistant with no warm to call', () => {
+      assert.strictEqual(disabled.warm, undefined);
+      assert.strictEqual(typeof enabled.warm, 'function');
+    });
+
+    // Caught rather than left to throw. Against an older checkout there is no
+    // warm() at all, and an exception here would abort the whole differential
+    // run rather than failing this one check.
+    let posted = null;
+    let warmError = null;
+    try {
+      await enabled.warm();
+      posted = axiosStub.posts()[0];
+    } catch (err) {
+      warmError = err.message;
+    }
+    check('the warm-up asks for the model and generates nothing', () => {
+      assert.strictEqual(warmError, null);
+      assert.ok(posted.url.includes('/api/generate'), posted.url);
+      assert.strictEqual(posted.body.prompt, '');
+      assert.strictEqual(posted.body.model, 'llama3.1:8b');
+    });
+  });
+
+  await section('the reply has a token ceiling', async () => {
+    // done_reason is how Ollama says why it stopped. "length" means num_predict
+    // ran out, and the text it hands back is cut wherever the counter did.
+    const replyWith = async (env, response, doneReason) => {
+      resetModules({ AI_PREFIX_MODE: 'never', ...env });
+      axiosStub = makeAxios({
+        '/api/generate': async () => ({
+          data: { response, done_reason: doneReason, total_duration: 1e9, eval_count: 400 },
+        }),
+      });
+      require(srcFile('bots', 'assistant.js'));
+      const bot = capturedBot;
+      const text = await bot.handle('c1', 'hello', { isSim: true });
+      return { text, body: axiosStub.posts()[0].body };
+    };
+
+    const capped = await replyWith({}, 'Sure thing.', 'stop');
+    check('the ceiling reaches the model as num_predict', () =>
+      assert.strictEqual(capped.body.options.num_predict, 400)
+    );
+
+    const off = await replyWith({ ASSISTANT_MAX_TOKENS: '0' }, 'Sure thing.', 'stop');
+    check('0 sends no ceiling at all', () =>
+      assert.ok(!('num_predict' in off.body.options), JSON.stringify(off.body.options))
+    );
+
+    check('a reply that finished normally is left exactly as written', () =>
+      assert.strictEqual(capped.text, 'Sure thing.')
+    );
+
+    const cut = await replyWith({}, 'Saturday works. I will check with Dan and le', 'length');
+    check('a reply stopped at the ceiling loses its unfinished sentence', () =>
+      assert.strictEqual(cut.text, 'Saturday works.')
+    );
+
+    // Better a single unterminated sentence than nothing at all.
+    const nothing = await replyWith({}, 'I was going to say something rather long and', 'length');
+    check('a reply with no finished sentence is sent as it stands', () =>
+      assert.strictEqual(nothing.text, 'I was going to say something rather long and')
+    );
+
+    // Truncating a JSON document leaves it unparseable, which would turn a
+    // briefing that was merely long into no briefing at all.
+    resetModules({ SUMMARY_FORMAT: 'json' });
+    axiosStub = makeAxios({
+      '/api/generate': async () => ({
+        data: { response: '{"urgency":"today","wants":"w","deadline":"","draft_reply":"d"}' },
+      }),
+    });
+    require(srcFile('bots', 'assistant.js'));
+    await capturedBot.handle('c2', 'hello', { isSim: true });
+    const briefing = axiosStub.posts().find((p) => p.body.format);
+    check('the briefing is never given a ceiling', () =>
+      assert.ok(!briefing || !briefing.body.options.num_predict, JSON.stringify(briefing?.body))
+    );
+  });
+
+  await section('showing that a reply is being written', async () => {
+    const typingChat = { states: [] };
+    typingChat.sendStateTyping = async () => typingChat.states.push('typing');
+    typingChat.clearState = async () => typingChat.states.push('cleared');
+
+    const shown = bootRunner({ REPLY_MODE: 'always', TYPING_INDICATOR: 'true' });
+    shown.client.typingChat = typingChat;
+    await shown.deliver({ body: 'you around' });
+    await settle();
+
+    check('the chat is shown as typing while the reply is written', () =>
+      assert.ok(typingChat.states.includes('typing'), JSON.stringify(typingChat.states))
+    );
+    check('the state is cleared once the reply has gone', () =>
+      assert.strictEqual(typingChat.states[typingChat.states.length - 1], 'cleared')
+    );
+
+    const quiet = bootRunner({ REPLY_MODE: 'always', TYPING_INDICATOR: 'false' });
+    quiet.client.typingChat = { sendStateTyping: async () => {}, clearState: async () => {} };
+    await quiet.deliver({ body: 'you around' });
+    check('TYPING_INDICATOR=false never asks for the chat', () =>
+      assert.strictEqual(quiet.client.chatRequests.length, 0)
+    );
+
+    // getChatById returns null here, which stands in for a chat that cannot be
+    // fetched. Decoration must never be the reason somebody loses a reply.
+    const broken = bootRunner({ REPLY_MODE: 'always', TYPING_INDICATOR: 'true' });
+    await broken.deliver({ body: 'you around' });
+    check('a chat that cannot be fetched still gets its reply', () => {
+      assert.strictEqual(broken.seen.length, 1, JSON.stringify(broken.seen));
+      assert.strictEqual(broken.client.sent.length, 1);
+    });
   });
 
   const failed = results.filter(([ok]) => !ok).length;

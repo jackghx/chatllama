@@ -552,10 +552,17 @@ Sam    19:41  hey jack are you up on tuesday
 Sam    19:41  oh wait actually thursday
 ```
 
-Generation starts on the first message immediately. When the second arrives, the
-in-flight request is cancelled, the two lines are joined into one turn, and the
-reply is written again from the top. Sam gets one answer about Thursday rather
-than an answer about Tuesday followed by a correction.
+Nothing starts for `REPLY_DEBOUNCE_MS`, two seconds by default, so here the
+correction lands before any work has begun and the two lines are simply joined
+into one turn. Sam gets one answer about Thursday rather than an answer about
+Tuesday followed by a correction, and it cost one generation.
+
+A correction arriving later than that has a request already in flight. It is
+cancelled, the lines are joined the same way, and the reply is written again
+from the top. Same answer, but the seconds already spent are gone, which is what
+the wait exists to avoid. The wait is measured from their last message and
+capped at three times its length, so someone typing steadily cannot defer their
+own answer indefinitely.
 
 Cancelling closes the socket, which stops Ollama generating rather than only
 throwing away the result, so an interrupted reply costs the seconds it had run
@@ -575,15 +582,23 @@ would never get an answer at all. Past the cap the reply is finished and sent,
 and anything further is answered separately. `0` turns the whole thing off and
 answers every message on its own.
 
-A correction does not count against `MAX_REPLIES_PER_HOUR`, because it does not
-produce a reply of its own. Look for this in the log:
+Messages that arrive during the wait do not count against it, because nothing
+was scrapped. A burst of five sent in one breath is still one generation and one
+reply, however low `MAX_INTERRUPTS` is set.
+
+A correction does not count against `MAX_REPLIES_PER_HOUR` either, because it
+does not produce a reply of its own. Look for this in the log:
 
 ```
 [assistant] <- sam@lid: hey jack are you up on tuesday
 [assistant] <- sam@lid: oh wait actually thursday
-[assistant] .. sam@lid: amended, writing it again
 [assistant] -> sam@lid: [AI] thursday is easier for me to pass on, what time?
+[ollama] llama3.1:8b: 9.4s, 41 tokens at 6.8/s
 ```
+
+One generation, no `amended` line, because the correction beat the wait. When it
+does not, an `.. sam@lid: amended, writing it again` line appears between them
+and the log shows two generations for the one reply.
 
 ## What it will not answer
 
@@ -630,6 +645,8 @@ with comments.
 | `ASSISTANT_MEMORY_WINDOW` | Lines of history kept per conversation, default 20 |
 | `OLLAMA_THINK` | `false` turns reasoning off, empty leaves the field unsent |
 | `OLLAMA_KEEP_ALIVE` | How long Ollama holds the model loaded, e.g. `30m` or `-1`. Empty uses its default |
+| `OLLAMA_WARMUP` | Loads the model when someone starts a conversation, so the prefix does not pay for it, default true |
+| `ASSISTANT_MAX_TOKENS` | Ceiling on a reply, default 400. A reply that reaches it is cut back to its last finished sentence. 0 removes it |
 | `SYSTEM_PROMPT_FILE` / `SYSTEM_PROMPT` | Persona, overriding the bundled default |
 | `AI_PREFIX` / `AI_PREFIX_MODE` | Wording and frequency of the marker, default `[AI]` and `always` |
 | `REPLY_MODE` | `auto`, `always`, `prefix` or `off`, default `auto` |
@@ -648,6 +665,8 @@ with comments.
 | `ALLOW_GROUPS` | Reply in group chats, default false |
 | `MAX_REPLIES_PER_HOUR` | Per-conversation cap on model-written replies, default 20, zero disables |
 | `MAX_INTERRUPTS` | Restarts allowed when a sender adds to a reply in progress, default 3 |
+| `REPLY_DEBOUNCE_MS` | Quiet needed before a reply is started, default 2000, so a question sent in parts costs one generation. 0 starts at once |
+| `TYPING_INDICATOR` | Show "typing..." while a reply is being written, default true |
 | `RATE_LIMIT_NOTICE` | Sent once when a conversation hits the cap, empty sends nothing |
 | `IGNORE_OLDER_THAN_SECONDS` | Drops the backlog replayed on connect, default 30 |
 | `N8N_WEBHOOK_URL` | Optional, empty disables webhook logging |
@@ -844,10 +863,33 @@ is the fastest option going, at the cost of the fields n8n branches on.
 **It asks for the QR code again.** The session in `.wwebjs_auth/` was removed,
 or `clientId` in `src/bots/assistant.js` changed. Scan once more.
 
-**Replies are slow.** CPU inference is the bottleneck, not prompt length. A
-smaller model helps more than a shorter prompt. If the model is a reasoning one,
-it is thinking before every reply and none of that reasoning is used here. Set
-`OLLAMA_THINK=false`.
+**Replies are slow.** Every generation logs what it cost, so start there rather
+than guessing:
+
+```
+[ollama] llama3.1:8b: 48.3s, load 31.1s, prompt 0.4s, 112 tokens at 6.6/s
+```
+
+`load` is the model being read off disk and has nothing to do with the question
+asked. If it dominates, the model is being evicted between messages. Set
+`OLLAMA_KEEP_ALIVE=30m` and leave `OLLAMA_WARMUP` on, which loads it when
+somebody starts a conversation instead of when they finally ask something.
+`auto` mode makes this worse than it sounds: the fixed reply never touches the
+model, so on a quiet number nothing keeps it resident and almost every prefixed
+message starts cold.
+
+If the token rate is what is low, that is CPU inference and no amount of
+configuration fixes it. `ASSISTANT_MAX_TOKENS` bounds the worst case rather than
+the typical one, so it helps a model that rambles and does nothing for a model
+that is simply slow. If the model is a reasoning one it is thinking before every
+reply and none of that reasoning is used here, so set `OLLAMA_THINK=false`.
+
+`REPLY_DEBOUNCE_MS` is worth checking if the log shows the same conversation
+generating several times over: somebody is sending their question in parts and
+each part is scrapping the last attempt.
+
+`TYPING_INDICATOR` makes nothing faster, but it is the difference between a wait
+that reads as a broken number and one that reads as somebody writing.
 
 **It texted someone its own reasoning.** A model whose template writes thinking
 into the reply rather than into Ollama's separate field. `<think>` blocks are
