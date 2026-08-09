@@ -68,6 +68,13 @@ async function generate({
   // Only sent when configured. Some builds reject the field outright on a model
   // that has no thinking capability, so an unset variable changes nothing.
   if (think !== null && think !== undefined) body.think = think;
+  // A bare number is seconds and has to travel as one. Anything else is a
+  // duration Ollama parses itself, such as 30m, or -1 for indefinitely.
+  if (ollama.keepAlive) {
+    body.keep_alive = /^-?\d+$/.test(ollama.keepAlive)
+      ? Number(ollama.keepAlive)
+      : ollama.keepAlive;
+  }
 
   if (signal?.aborted) throw new Aborted();
 

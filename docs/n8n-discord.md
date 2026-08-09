@@ -168,6 +168,33 @@ For the summary branch, a second Discord node on the other output of the Switch:
 If you want the raw exchange underneath, `{{ $json.body.transcript.join("\n") }}`
 in a field value works, but mind the 1024 character limit below.
 
+### The triage embed, and the two ways it breaks
+
+The fields are the reason to run this at all, so the summary embed is worth
+building properly:
+
+| Name | Value | Inline |
+| --- | --- | --- |
+| Urgency | `{{ $json.body.triage ? $json.body.triage.urgency : "unknown" }}` | true |
+| By | `{{ $json.body.triage && $json.body.triage.deadline ? $json.body.triage.deadline : "no deadline" }}` | true |
+| Draft | `{{ $json.body.triage && $json.body.triage.draftReply ? $json.body.triage.draftReply : "nothing drafted" }}` | false |
+
+Both guards are load bearing. `triage` is `null` whenever the model did not
+produce usable fields, and reading through a null throws inside the expression
+rather than rendering empty, which fails the whole node. Separately, Discord
+rejects an embed field whose value is an empty string, and `deadline` is empty
+far more often than not, because most messages do not have one. Either fault
+shows up as the node erroring, not as a message with a gap in it.
+
+Note `draftReply`, not `draft_reply`. The model is asked for snake case and the
+field is renamed on the way through, so what reaches n8n is camel case.
+
+For colour by urgency, a Switch on
+`{{ $json.body.triage ? $json.body.triage.urgency : "whenever" }}` into three
+Discord nodes is easier to follow later than one node with an expression in the
+Color field, and it lets `now` go to a channel that notifies you while
+`whenever` goes to one you read on Sunday.
+
 ## If you would rather use an HTTP Request node
 
 Point it at the Discord webhook URL, method `POST`, body type JSON:

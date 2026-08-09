@@ -90,6 +90,7 @@ const CONFIG_ENV = [
   'OLLAMA_HOST',
   'OLLAMA_TIMEOUT_MS',
   'OLLAMA_THINK',
+  'OLLAMA_KEEP_ALIVE',
   'REPLY_MODE',
   'COMMAND_PREFIX',
   'AUTO_REPLY_TEXT',
@@ -1093,6 +1094,37 @@ async function main() {
     check('assistant.md is not empty after stripping', () => assert.ok(live.length > 100));
     check('summary.md is not empty after stripping', () =>
       assert.ok(strip(path.join(dir, 'summary.md')).length > 100)
+    );
+  });
+
+  await section('keeping the model loaded', async () => {
+    const requestWith = async (env) => {
+      resetModules(env);
+      axiosStub = makeAxios(ollamaReplies('hello'));
+      const { generate } = require(srcFile('lib', 'ollama.js'));
+      await generate({ model: 'm', prompt: 'p' });
+      return axiosStub.posts()[0].body;
+    };
+
+    const unset = await requestWith({});
+    check('unset leaves Ollama to its own default', () =>
+      assert.ok(!('keep_alive' in unset), JSON.stringify(unset))
+    );
+
+    const duration = await requestWith({ OLLAMA_KEEP_ALIVE: '30m' });
+    check('a duration travels as written', () =>
+      assert.strictEqual(duration.keep_alive, '30m')
+    );
+
+    // Ollama reads a bare number as seconds, and only if it arrives as one.
+    const seconds = await requestWith({ OLLAMA_KEEP_ALIVE: '900' });
+    check('a bare number is sent as seconds rather than a string', () =>
+      assert.strictEqual(seconds.keep_alive, 900)
+    );
+
+    const forever = await requestWith({ OLLAMA_KEEP_ALIVE: '-1' });
+    check('-1 keeps it loaded indefinitely', () =>
+      assert.strictEqual(forever.keep_alive, -1)
     );
   });
 

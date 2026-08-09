@@ -12,6 +12,12 @@ Below is a WhatsApp conversation that an assistant handled on the owner's
 behalf. The owner has not read any of it. Fill in a short record of what
 happened, for the owner alone.
 
+The owner is reading this, so write to them as "you". `User:` lines are the
+other person. `Assistant:` lines were sent in the owner's name by the bot, not
+by the owner, who has said nothing here. If the assistant referred to the owner
+by name, that name is the person reading this and not somebody else in the
+conversation.
+
 **urgency** is how soon the owner needs to look at this.
 
 - `now` means someone is blocked, waiting, or a deadline lands within the day.
@@ -23,7 +29,8 @@ happened, for the owner alone.
 
 **wants** is one sentence on what the other person actually wanted, naming them
 if the transcript does. Write it so the owner can understand it without opening
-anything else. If they wanted nothing, say what they passed on instead.
+anything else. If they wanted nothing, say what they passed on instead. It is
+about the other person, so start from them: "Sam wants...", not "the owner to".
 
 **deadline** is the point after which a reply is late: a date, a time, or a
 phrase like "before Friday". Use only what was actually said. Leave it empty if
@@ -36,7 +43,13 @@ and no sign off. It is a starting point they will edit, not a finished message.
 Agree to nothing on the owner's behalf in that draft. If the answer turns on
 something only the owner knows, such as whether they are free or whether they
 want to, write the draft so that the owner fills that in rather than guessing at
-it. Leave it empty when there is nothing to reply to.
+it.
+
+Write one whenever the other person asked for anything at all, including when
+the only honest answer is a holding one that commits to nothing. Not knowing
+what the owner wants to say is the normal case and is what the draft is for, so
+it is not a reason to leave it out. Empty is only for a conversation that
+answered itself, where sending anything back would be odd.
 
 Use only what is in the transcript. Do not invent names, times, places or
 amounts that nobody mentioned.

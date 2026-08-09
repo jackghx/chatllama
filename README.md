@@ -525,6 +525,7 @@ with comments.
 | `OLLAMA_HOST` | Base URL of the Ollama instance |
 | `ASSISTANT_MODEL` | Ollama model tag, must be one you have pulled |
 | `OLLAMA_THINK` | `false` turns reasoning off, empty leaves the field unsent |
+| `OLLAMA_KEEP_ALIVE` | How long Ollama holds the model loaded, e.g. `30m` or `-1`. Empty uses its default |
 | `SYSTEM_PROMPT_FILE` / `SYSTEM_PROMPT` | Persona, overriding the bundled default |
 | `AI_PREFIX` / `AI_PREFIX_MODE` | Wording and frequency of the marker |
 | `REPLY_MODE` | `auto`, `always`, `prefix` or `off`, default `auto` |
@@ -716,11 +717,21 @@ been idle for `SUMMARY_IDLE_MINUTES`, which on the default of 10 is past
 Ollama's own five-minute `keep_alive`, so the model has been unloaded and the
 call pays to load it back off disk before generating anything.
 
-Point `SUMMARY_MODEL` at something small, since triage needs far less of a model
-than conversation does, and raise `SUMMARY_TIMEOUT_MS` if it is still tight.
-Raising `OLLAMA_TIMEOUT_MS` instead is the wrong lever: that one is how long
-somebody waits for a reply. `SUMMARY_FORMAT=prose` drops the schema altogether
-and is the fastest option, at the cost of the fields n8n branches on.
+Deal with the load first, because it costs nothing and it is usually most of the
+time. `OLLAMA_KEEP_ALIVE=30m` pins the model in memory across the idle window,
+so the briefing runs warm. It is sent per request, so it holds the model this
+bot uses and does not change how that machine treats anything else. Setting
+`SUMMARY_IDLE_MINUTES` below 5 does the same job by fitting inside Ollama's own
+default, at the cost of briefings that arrive sooner and split a slow
+conversation in two.
+
+If it is still tight after that, raise `SUMMARY_TIMEOUT_MS`. Nobody is waiting
+on a briefing, so it can have as long as it needs. Raising `OLLAMA_TIMEOUT_MS`
+is the wrong lever: that one is how long somebody sits looking at their phone.
+
+Only then start giving things up. `SUMMARY_MODEL` can point at something smaller
+than the one answering, and `SUMMARY_FORMAT=prose` drops the schema entirely and
+is the fastest option going, at the cost of the fields n8n branches on.
 
 **It asks for the QR code again.** The session in `.wwebjs_auth/` was removed,
 or `clientId` in `src/bots/assistant.js` changed. Scan once more.

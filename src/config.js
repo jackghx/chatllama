@@ -36,6 +36,13 @@ module.exports = {
     host: (process.env.OLLAMA_HOST || 'http://127.0.0.1:11434').replace(/\/+$/, ''),
     timeoutMs: num(process.env.OLLAMA_TIMEOUT_MS, 120000),
     think: optBool(process.env.OLLAMA_THINK),
+
+    // How long Ollama holds the model in memory after a request. Empty leaves
+    // its own default alone, which is five minutes, and briefings fire after
+    // ten of silence, so on the defaults every single one loads the model off
+    // disk before it can start. Sent per request rather than set on the server,
+    // so this only pins the model this bot uses.
+    keepAlive: (process.env.OLLAMA_KEEP_ALIVE || '').trim(),
   },
 
   access: {
