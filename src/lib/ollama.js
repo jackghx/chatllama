@@ -85,20 +85,25 @@ function logTiming(model, m) {
 }
 
 /**
- * Loads a model into memory without generating anything.
+ * Loads a model and reads a prompt into its cache, without writing a reply.
  *
- * An empty prompt is Ollama's own way of preloading: it reads the weights in
- * and returns, with no tokens produced and so nothing to throw away if the
- * question never comes. Called when somebody opens a conversation, so that a
- * cold start is paid during the seconds they spend reading the fixed reply
- * rather than after they have asked something and are watching the screen.
+ * Both halves matter, and the second is the larger by far. Loading the weights
+ * is the obvious cost, but reading the prompt is what actually dominates on a
+ * CPU: measured on an 8B, a 480-token system prompt took 82 seconds to read
+ * against 12 to load. Ollama keeps the evaluated prefix, so the same prompt
+ * arriving again costs almost nothing, and every reply shares the persona as
+ * its opening. Sending it here means the person asking pays neither.
+ *
+ * num_predict is 1 rather than 0. One token is half a second and guarantees the
+ * prompt was evaluated in full, where 0 is a value different Ollama builds have
+ * disagreed about and is not worth being clever over.
  *
  * Its own timeout, and a generous one. Reading several gigabytes off a disk
  * that is also running everything else takes as long as it takes, and there is
  * nobody waiting on this.
  */
-async function warmUp({ model, timeoutMs = 120000 }) {
-  const body = withKeepAlive({ model, prompt: '', stream: false });
+async function warmUp({ model, prompt = '', timeoutMs = 120000 }) {
+  const body = withKeepAlive({ model, prompt, stream: false, options: { num_predict: 1 } });
   await axios.post(`${ollama.host}/api/generate`, body, { timeout: timeoutMs });
 }
 

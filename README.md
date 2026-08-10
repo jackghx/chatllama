@@ -645,7 +645,7 @@ with comments.
 | `ASSISTANT_MEMORY_WINDOW` | Lines of history kept per conversation, default 20 |
 | `OLLAMA_THINK` | `false` turns reasoning off, empty leaves the field unsent |
 | `OLLAMA_KEEP_ALIVE` | How long Ollama holds the model loaded, e.g. `30m` or `-1`. Empty uses its default |
-| `OLLAMA_WARMUP` | Loads the model when someone starts a conversation, so the prefix does not pay for it, default true |
+| `OLLAMA_WARMUP` | Reads the model and the persona in when someone starts a conversation, so the question does not pay for it, default true |
 | `ASSISTANT_MAX_TOKENS` | Ceiling on a reply, default 400. A reply that reaches it is cut back to its last finished sentence. 0 removes it |
 | `SYSTEM_PROMPT_FILE` / `SYSTEM_PROMPT` | Persona, overriding the bundled default |
 | `AI_PREFIX` / `AI_PREFIX_MODE` | Wording and frequency of the marker, default `[AI]` and `always` |
@@ -864,25 +864,38 @@ is the fastest option going, at the cost of the fields n8n branches on.
 or `clientId` in `src/bots/assistant.js` changed. Scan once more.
 
 **Replies are slow.** Every generation logs what it cost, so start there rather
-than guessing:
+than guessing. On a CPU-only host with llama3.1:8b, cold:
 
 ```
-[ollama] llama3.1:8b: 48.3s, load 31.1s, prompt 0.4s, 112 tokens at 6.6/s
+[ollama] llama3.1:8b: 110.3s, load 12.0s, prompt 81.7s, 36 tokens at 2.2/s
 ```
 
-`load` is the model being read off disk and has nothing to do with the question
-asked. If it dominates, the model is being evicted between messages. Set
-`OLLAMA_KEEP_ALIVE=30m` and leave `OLLAMA_WARMUP` on, which loads it when
-somebody starts a conversation instead of when they finally ask something.
-`auto` mode makes this worse than it sounds: the fixed reply never touches the
-model, so on a quiet number nothing keeps it resident and almost every prefixed
-message starts cold.
+and the same question once the model is loaded and the persona is cached:
 
-If the token rate is what is low, that is CPU inference and no amount of
-configuration fixes it. `ASSISTANT_MAX_TOKENS` bounds the worst case rather than
-the typical one, so it helps a model that rambles and does nothing for a model
-that is simply slow. If the model is a reasoning one it is thinking before every
-reply and none of that reasoning is used here, so set `OLLAMA_THINK=false`.
+```
+[ollama] llama3.1:8b: 30.1s, load 0.2s, prompt 4.2s, 55 tokens at 2.1/s
+```
+
+The intuition to give up is that the model spends its time writing. It does not.
+`prompt` is it reading, and cold it was three quarters of the wait. `load` is
+the weights coming off disk and was a ninth of it. Reading the same persona a
+second time cost 4 seconds instead of 82, because Ollama keeps what it has
+already evaluated.
+
+So the two settings that matter are `OLLAMA_KEEP_ALIVE=30m`, which stops the
+model being evicted between conversations, and `OLLAMA_WARMUP`, which reads the
+persona in when somebody starts a conversation rather than when they ask a
+question. `auto` mode makes both matter more than they sound: the fixed reply
+never touches the model, so on a quiet number nothing keeps anything warm.
+
+`prompt` staying high on a warm model means the prompt is growing. Each turn
+pays to read what was said in the previous one, so a long reply is charged twice,
+once to write and once to read back. `ASSISTANT_MEMORY_WINDOW` and a persona
+that does not reintroduce itself every message are the levers there.
+
+Only the token rate is fixed by hardware. If the model is a reasoning one it is
+thinking before every reply and none of that reasoning is used here, so set
+`OLLAMA_THINK=false`.
 
 `REPLY_DEBOUNCE_MS` is worth checking if the log shows the same conversation
 generating several times over: somebody is sending their question in parts and

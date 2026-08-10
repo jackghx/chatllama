@@ -365,7 +365,12 @@ run({
   observe,
   // Left off entirely when it is switched off, so the runner has nothing to
   // call rather than a function that quietly does nothing.
-  warm: ollamaCfg.warmup ? () => warmUp({ model: cfg.model }) : undefined,
+  // The persona, because it opens every prompt this bot sends and reading it is
+  // the largest single cost in a reply. Warming with it means the cache is
+  // already holding it by the time somebody asks something.
+  warm: ollamaCfg.warmup
+    ? () => warmUp({ model: cfg.model, prompt: systemPrompt })
+    : undefined,
   // Who the conversation is with, once the runner has managed to look them up.
   rename: (conversationId, name) => digest.rename(conversationId, name),
   // Pending summaries only exist in memory, so a restart would drop them.

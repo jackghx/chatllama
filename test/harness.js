@@ -2854,11 +2854,16 @@ async function main() {
     } catch (err) {
       warmError = err.message;
     }
-    check('the warm-up asks for the model and generates nothing', () => {
+    check('the warm-up reads the persona in and writes nothing', () => {
       assert.strictEqual(warmError, null);
       assert.ok(posted.url.includes('/api/generate'), posted.url);
-      assert.strictEqual(posted.body.prompt, '');
       assert.strictEqual(posted.body.model, 'llama3.1:8b');
+      // The persona itself, not an empty prompt. Loading the weights is the
+      // smaller half of a cold reply; reading this is the larger one, and it
+      // only counts if what is cached is what the real prompt starts with.
+      const { loadSystemPrompt } = require(srcFile('lib', 'prompt.js'));
+      assert.strictEqual(posted.body.prompt, loadSystemPrompt().text);
+      assert.strictEqual(posted.body.options.num_predict, 1);
     });
   });
 
