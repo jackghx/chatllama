@@ -2789,8 +2789,18 @@ async function main() {
       assert.strictEqual(warm.warmed.length, 1, JSON.stringify(warm.warmed))
     );
 
+    // Otherwise the first question after a restart is the one that pays to read
+    // the persona in, which is the case the warm-up exists to remove.
+    const booted = bootRunner({ REPLY_MODE: 'auto', AUTO_REPLY_TEXT: 'not here' });
+    await booted.client.emit('ready');
+    await settle();
+    check('starting up warms the model without waiting to be messaged', () =>
+      assert.strictEqual(booted.warmed.length, 1, JSON.stringify(booted.warmed))
+    );
+
     // Nothing can reach the model while it is off, so loading it is pure waste.
     const off = bootRunner({ REPLY_MODE: 'off' });
+    await off.client.emit('ready');
     await off.deliver({ body: 'hello' });
     check('a bot that is switched off warms nothing', () =>
       assert.strictEqual(off.warmed.length, 0)

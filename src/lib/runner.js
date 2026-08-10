@@ -397,6 +397,11 @@ function runWhatsApp(bot) {
     for (const line of identity.report()) console.log(line);
 
     reportAccess();
+
+    // Once at startup, so the first question after a restart is not the one
+    // that pays to read the persona in. Nothing is waiting on it, and by the
+    // time anybody writes it has long since finished.
+    if (runtime.effectiveMode() !== 'off') warmModel();
   });
 
   /**
