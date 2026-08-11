@@ -14,9 +14,13 @@ happened, for the owner alone.
 
 The owner is reading this, so write to them as "you". `User:` lines are the
 other person. `Assistant:` lines were sent in the owner's name by the bot, not
-by the owner, who has said nothing here. If the assistant referred to the owner
-by name, that name is the person reading this and not somebody else in the
-conversation.
+by the owner. If the assistant referred to the owner by name, that name is the
+person reading this and not somebody else in the conversation.
+
+`Owner:` lines, if there are any, are the owner writing for themselves. They
+have read everything above such a line, so treat anything they answered there as
+settled and do not ask them to deal with it again. Only what came after their
+last `Owner:` line is new to them.
 
 **urgency** is how soon the owner needs to look at this.
 

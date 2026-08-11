@@ -4,13 +4,15 @@ const qrcode = require('qrcode-terminal');
 
 const { access, send: sendCfg } = require('../config');
 const { listModels } = require('./ollama');
-const { enabled: webhookEnabled } = require('./webhook');
+const { enabled: webhookEnabled, notify } = require('./webhook');
 const { SerialQueue } = require('./queue');
 const { RateLimiter } = require('./ratelimit');
 const { RuntimeState } = require('./state');
 const { runCommand, isCommand } = require('./commands');
 const { Identity } = require('./identity');
 const { startSendApi, stopSendApi } = require('./sendapi');
+const { shared: settings } = require('./settings');
+const { DiscordStatus } = require('./discord');
 
 // Long enough for a summary generation to finish. pm2 sends SIGKILL after its
 // kill_timeout, which ecosystem.config.js raises to sit above this.
@@ -27,6 +29,46 @@ const MAX_DEBOUNCE_MULTIPLE = 3;
 // One model, however many people are writing in, so warming it for each of them
 // would be the same load requested over and over.
 const WARM_THROTTLE_MS = 60000;
+
+// How long to wait before trying to reconnect, and the ceiling it backs off to.
+// The first retry is quick because most disconnections are a dropped socket
+// that comes straight back; the ceiling exists so that a session which is
+// genuinely logged out is not reopening a browser every ten seconds all night.
+const RECONNECT_MS = 10000;
+const RECONNECT_MAX_MS = 5 * 60 * 1000;
+
+/**
+ * What each kind of attachment is called, when there is no text to go on.
+ *
+ * A message with no body used to be dropped outright, which meant a voice note
+ * reached nobody: no fixed reply, nothing in the transcript, and so nothing in
+ * the briefing either. Somebody leaving three voice notes got silence and the
+ * owner was told none of it, which is the one thing auto mode exists to stop.
+ *
+ * A whitelist rather than a catch-all, because most of what WhatsApp calls a
+ * message is not one: delivery receipts, key changes, group joins and reactions
+ * all arrive on this event, and answering those is worse than ignoring them.
+ * Anything not named here is still dropped.
+ *
+ * Two forms of each, because they are read in two different places. The
+ * singular goes in the transcript, which only the model ever sees. The plural
+ * goes in the message back to the person, where "Unable to process voice notes"
+ * reads as a number that has a policy, and "that came through as a voice note,
+ * which could not be read" reads as a machine apologising for itself.
+ */
+const MEDIA = {
+  image: { one: 'an image', many: 'images' },
+  video: { one: 'a video', many: 'videos' },
+  album: { one: 'an album', many: 'photo albums' },
+  ptt: { one: 'a voice note', many: 'voice notes' },
+  audio: { one: 'an audio file', many: 'audio files' },
+  document: { one: 'a document', many: 'documents' },
+  sticker: { one: 'a sticker', many: 'stickers' },
+  location: { one: 'a location', many: 'locations' },
+  vcard: { one: 'a contact card', many: 'contact cards' },
+  multi_vcard: { one: 'some contact cards', many: 'contact cards' },
+  poll_creation: { one: 'a poll', many: 'polls' },
+};
 
 let shutdownInstalled = false;
 
@@ -118,7 +160,7 @@ function stripPrefix(body, prefix) {
  * and why nobody is there.
  */
 function autoReply(runtime) {
-  const fixed = access.autoReplyText;
+  const fixed = settings.get('auto_reply');
   const reason = runtime.awayText;
 
   if (!reason) return fixed;
@@ -166,6 +208,19 @@ function startTyping(client, chatId) {
       .then(() => chat && chat.clearState())
       .catch(() => {});
   };
+}
+
+/**
+ * What goes back to somebody whose attachment could not be read.
+ *
+ * The fixed reply is added only in auto mode, because it is auto mode's line.
+ * In always mode it would announce that nobody is watching the number, on the
+ * one setting where the model is in fact answering everything.
+ */
+function mediaReply(runtime, what) {
+  const notice = String(settings.get('media_notice')).replace(/\{what\}/g, what);
+  const fixed = runtime.effectiveMode() === 'auto' ? autoReply(runtime) : '';
+  return [fixed, notice].filter(Boolean).join('\n\n');
 }
 
 function reportAccess() {
@@ -233,6 +288,7 @@ function isSelfChat(msg, runtime) {
  *   { kind: 'ignore',  chatId, reason }
  *   { kind: 'model',   chatId, text }
  *   { kind: 'auto',    chatId, text }
+ *   { kind: 'media',   chatId, text, media }
  *   { kind: 'command', chatId, text }
  */
 function classify(msg, runtime, { simulated = false, identity = null } = {}) {
@@ -287,23 +343,49 @@ function classify(msg, runtime, { simulated = false, identity = null } = {}) {
   // Checked after the allowlist and after capture, so that switching the bot
   // off silences it without also blinding the diagnostics.
   if (mode === 'off') return ignore('off');
-  if (!body) return ignore('empty');
 
-  // always is the only mode where a bare message reaches the model.
-  if (mode === 'always') return { kind: 'model', chatId, text: body };
+  // An attachment with no caption. It never reaches the model, which cannot
+  // read any of these, but it is still a person writing in: it earns the fixed
+  // reply, a line in the transcript and a mention in the briefing, so that
+  // sending a voice note is not the one way to reach this number that produces
+  // no reply to them and no notification to the owner.
+  if (!body) {
+    const media = MEDIA[msg.type];
+    if (!media) return ignore('empty');
+    return {
+      kind: 'media',
+      chatId,
+      text: `(sent ${media.one}, which could not be read)`,
+      media: media.many,
+    };
+  }
 
+  // Whether the owner has answered this person themselves recently, in which
+  // case the bot keeps out of this one conversation. Everything below either
+  // defers to it or is a deliberate request that outranks it.
+  const handed = runtime.isHandedOver(chatId);
+
+  // always is the only mode where a bare message reaches the model. Handed
+  // over, it is recorded and left alone: the owner is demonstrably there, and
+  // the model answering underneath them is the thing being prevented.
+  if (mode === 'always') return { kind: handed ? 'auto' : 'model', chatId, text: body };
+
+  // An explicit prefix is honoured whatever else is true. Somebody who types
+  // "/ai what is the address" has asked the assistant a question on purpose,
+  // and refusing on the grounds that the owner is around would be answering a
+  // question nobody asked instead of the one they did.
   const text = stripPrefix(body, access.commandPrefix);
   if (text) return { kind: 'model', chatId, text };
 
   // Somebody already talking to the model stays talking to it. Asking for the
   // prefix on every message means the second half of a question gets the fixed
   // reply and has to be typed again, which is what people actually do.
-  if (runtime.isEngaged(chatId)) return { kind: 'model', chatId, text: body };
+  if (!handed && runtime.isEngaged(chatId)) return { kind: 'model', chatId, text: body };
 
   // Everything that is not a command gets the fixed reply instead, which is the
   // whole point of auto mode: instant, and it cannot say anything wrong. With
   // no text configured there is nothing to send, so it behaves as prefix mode.
-  if (mode === 'auto' && (runtime.awayText || access.autoReplyText)) {
+  if (mode === 'auto' && (runtime.awayText || settings.get('auto_reply'))) {
     return { kind: 'auto', chatId, text: body };
   }
 
@@ -351,29 +433,138 @@ function runWhatsApp(bot) {
   const limiter = new RateLimiter(access.maxRepliesPerHour);
   const runtime = new RuntimeState({
     mode: access.replyMode,
-    autoGapMs: access.autoReplyGapMinutes * 60 * 1000,
-    autoMaxPerDay: access.autoReplyMaxPerDay,
-    followUpMs: access.followUpMinutes * 60 * 1000,
+    autoGapMs: settings.get('gap') * 60 * 1000,
+    autoMaxPerDay: settings.get('max_per_day'),
+    followUpMs: settings.get('follow_up') * 60 * 1000,
+    handoverMs: settings.get('handover') * 60 * 1000,
+    stateFile: access.stateFile,
+    isQuiet: (at) => settings.isQuiet(at),
+    quietMode: settings.get('quiet_mode'),
   });
+
+  // The timings live on the runtime as numbers, so a setting changed by command
+  // has to be pushed into it rather than waiting to be read. Everything else is
+  // read on demand and needs nothing here.
+  settings.onChange = (name, value) => {
+    if (name === 'gap') runtime.autoGapMs = value * 60 * 1000;
+    if (name === 'follow_up') runtime.followUpMs = value * 60 * 1000;
+    if (name === 'handover') runtime.handoverMs = value * 60 * 1000;
+    if (name === 'max_per_day') runtime.autoMaxPerDay = value;
+    if (name === 'quiet_mode') runtime.quietMode = value;
+    if (name === 'contacts') identity.reload(value, client);
+    if (bot.settingChanged) bot.settingChanged(name, value);
+  };
+
+  // Loud, because a bot that came back up still away is doing exactly what it
+  // was told and would otherwise look like one ignoring REPLY_MODE.
+  if (runtime.restored) console.log(`[state] restored from the last run: ${runtime.restored}`);
 
   // Built before connecting, so whatever was cached from last time is in place
   // by the time the first message can arrive.
   const identity = new Identity({
-    entries: access.allowedContacts,
+    entries: settings.get('contacts'),
     cacheFile: access.contactCacheFile,
     ttlDays: access.contactCacheTtlDays,
     delayMs: access.contactResolveDelayMs,
   });
 
+  // Set by the shutdown handler, so that a session torn down on purpose is not
+  // then chased by the reconnect loop that exists for the ones that drop.
+  let closingDown = false;
+
+  /**
+   * Tells whatever is watching that the session came or went.
+   *
+   * Separate from the per-message events, and worth sending even though nobody
+   * asked for it: this is the one thing the owner cannot find out by looking at
+   * WhatsApp, because the symptom is that nothing happened.
+   */
+  function notifyStatus(event, detail) {
+    notify({ event, bot: bot.name, status: runtime.connection, detail });
+  }
+
   client.on('qr', (qr) => {
     console.log('[auth] scan this QR code with WhatsApp:');
     qrcode.generate(qr, { small: true });
+    // Reaching a QR means the stored session is gone, so no amount of
+    // reconnecting will fix it and somebody has to scan. Said once, on the
+    // change, rather than on every QR refresh.
+    if (runtime.noteConnection('needs_scan')) {
+      notifyStatus('session_lost', 'waiting for a QR code to be scanned');
+    }
   });
 
-  client.on('auth_failure', (m) => console.error('[auth] failed:', m));
-  client.on('disconnected', (r) => console.error('[auth] disconnected:', r));
+  /**
+   * Brings the session back up after it has dropped.
+   *
+   * This is the failure that matters most and shows least. The process is still
+   * running, pm2 sees nothing wrong, and a bot answering nobody is
+   * indistinguishable from a quiet afternoon, so the first anyone hears of it
+   * is the messages that were never covered. Hence both halves: it tells you,
+   * and then it tries to fix itself.
+   *
+   * destroy() first, because initialize() on a client whose browser is already
+   * gone leaves a puppeteer instance behind on every attempt. Its failure is
+   * ignored: there is usually nothing left to close, which is the whole reason
+   * this is running.
+   */
+  let reconnectTimer = null;
+  let reconnectIn = RECONNECT_MS;
+
+  function scheduleReconnect() {
+    if (reconnectTimer || closingDown) return;
+
+    const wait = reconnectIn;
+    reconnectIn = Math.min(reconnectIn * 2, RECONNECT_MAX_MS);
+    console.log(`[auth] reconnecting in ${Math.round(wait / 1000)}s`);
+
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      if (closingDown) return;
+
+      try {
+        await client.destroy();
+      } catch {
+        // Already gone, which is the normal case here.
+      }
+
+      try {
+        await client.initialize();
+      } catch (err) {
+        console.error('[auth] reconnect failed:', err.message);
+        // Only from the failure path. A successful initialize() ends at either
+        // 'ready' or 'qr', and neither is somewhere to retry from.
+        scheduleReconnect();
+      }
+    }, wait).unref();
+  }
+
+  client.on('auth_failure', (m) => {
+    console.error('[auth] failed:', m);
+    if (runtime.noteConnection('auth_failure', String(m))) {
+      notifyStatus('session_lost', `authentication failed: ${m}`);
+    }
+  });
+
+  client.on('disconnected', (reason) => {
+    console.error('[auth] disconnected:', reason);
+    if (runtime.noteConnection('disconnected', String(reason))) {
+      notifyStatus('session_lost', `disconnected: ${reason}`);
+    }
+    scheduleReconnect();
+  });
 
   client.on('ready', async () => {
+    // Whether this is the first connection or a recovery, because "back up" is
+    // only worth sending to anybody if it had gone down.
+    const recovered = runtime.connection !== 'starting';
+    reconnectIn = RECONNECT_MS;
+    runtime.noteConnection('ready');
+    if (recovered) {
+      console.log('[auth] reconnected');
+      notifyStatus('session_restored', 'the WhatsApp session is back');
+    }
+
     // The chat with yourself, which is where owner commands are read from
     // unless OWNER_COMMANDS says otherwise.
     runtime.addSelfChat((client.info && client.info.wid && client.info.wid._serialized) || null);
@@ -593,6 +784,92 @@ function runWhatsApp(bot) {
       .catch((err) => console.warn('[ollama] warm-up failed:', err.message));
   }
 
+  /**
+   * What is actually working, for anything watching from outside.
+   *
+   * The process being up is the least interesting fact about it. A WhatsApp
+   * session that dropped in the night, a queue that has stopped draining and an
+   * away nobody remembers setting all leave the process running and pm2 happy
+   * while the thing does not do its job.
+   *
+   * Read fresh on every call, because both callers are asking what is true now.
+   */
+  function readHealth() {
+    return {
+      status: runtime.connection === 'ready' ? 'up' : 'down',
+      connection: runtime.connection,
+      connectionNote: runtime.connectionNote,
+      connectionSince: new Date(runtime.connectionSince).toISOString(),
+      uptimeSeconds: Math.round((Date.now() - runtime.startedAt) / 1000),
+      lastMessageAt: runtime.lastMessageAt ? new Date(runtime.lastMessageAt).toISOString() : null,
+      queueDepth: queue.length,
+      mode: runtime.effectiveMode(),
+      away: runtime.awayUntil
+        ? {
+            until:
+              runtime.awayUntil === Infinity ? null : new Date(runtime.awayUntil).toISOString(),
+            reason: runtime.awayText,
+          }
+        : null,
+      quiet: settings.isQuiet(),
+      model: settings.get('model'),
+    };
+  }
+
+  // What a command is allowed to reach. Shared by the WhatsApp route and the
+  // HTTP one, so that "/ai away 2h" typed on a phone and the same text posted
+  // by n8n cannot drift into doing different things.
+  const commandHooks = {
+    cancelAll: (reason) => {
+      for (const chat of runtime.activeChats()) runtime.cancel(chat, reason);
+    },
+    brief: bot.brief ? () => bot.brief() : null,
+  };
+
+  /**
+   * Notes that the owner has answered somebody themselves.
+   *
+   * Reached from two places, because a reply you wrote and a reply you approved
+   * are the same thing as far as the other person is concerned, and the bot has
+   * to stop treating either conversation as unattended.
+   *
+   * The reply in flight is called off. Somebody who has started typing an
+   * answer of their own does not also want the model's arriving underneath it,
+   * and the model's was written without knowing theirs existed.
+   */
+  function recordOutbound(chatId, text) {
+    if (!chatId || !text) return;
+
+    // The same shape the inbound side keeps to. A group is off limits whatever
+    // direction it is travelling, and somebody outside the allowlist is
+    // somebody whose messages are dropped anyway, so a transcript of them would
+    // only ever be one-sided.
+    if (chatId.endsWith('@g.us') || chatId.endsWith('@broadcast')) return;
+    if (!identity.allows(chatId)) return;
+
+    if (runtime.cancel(chatId, 'answered by hand')) {
+      console.log(`[${bot.name}] .. ${chatId}: you answered first, so the reply was dropped`);
+    }
+
+    // The important half. Until this lapses, nothing automatic goes to this
+    // person: they are talking to the owner now, and a fixed reply saying
+    // nobody is watching the number would arrive seconds after proof otherwise.
+    if (!runtime.isHandedOver(chatId)) {
+      console.log(
+        `[${bot.name}] .. ${chatId}: yours now, nothing automatic for ` +
+          `${Math.round(runtime.handoverMs / 60000)} min`
+      );
+    }
+    runtime.noteHandedOver(chatId);
+    runtime.lastMessageAt = Date.now();
+
+    // Queued, so it lands in the transcript in the order it was sent rather
+    // than in front of a reply still being written for the same chat. Whether
+    // the words themselves are kept is the bot's decision, not this one's: the
+    // pending briefing has to be dropped either way.
+    if (bot.outbound) queue.push(async () => bot.outbound(chatId, text));
+  }
+
   const names = new Map();
   function nameFor(msg, chatId) {
     if (names.has(chatId)) return names.get(chatId);
@@ -650,17 +927,30 @@ function runWhatsApp(bot) {
       autoText: autoReply(runtime),
     };
 
+    // An attachment says exactly what the fixed reply says, plus a line about
+    // what could not be read, and is spent from the same allowance so that five
+    // photos are not five replies.
+    if (decision.kind === 'media') ctx.autoText = mediaReply(runtime, decision.media);
+
+    // Both kinds are answered without the model, and both are held to the same
+    // gap, so they share everything below.
+    const passive = decision.kind === 'auto' || decision.kind === 'media';
+
     // Worked out before the timestamp moves, because the gap is measured from
     // their last message. A plain message arriving while a reply is already
     // being written never gets the fixed line: it would land in the middle of
     // an answer being written for that same person. Dropping it is consistent,
     // since in auto mode it was never going to reach the model anyway.
-    const due = decision.kind === 'auto' && !live && runtime.shouldAutoReply(chatId);
+    // Handed over means recorded but not answered, so the briefing still covers
+    // the conversation while nothing goes out under the owner's name.
+    const due =
+      passive && !live && !runtime.isHandedOver(chatId) && runtime.shouldAutoReply(chatId);
     runtime.noteInbound(chatId);
+    runtime.lastMessageAt = Date.now();
 
     console.log(`[${bot.name}] <- ${chatId}: ${decision.text}`);
 
-    if (decision.kind === 'auto') {
+    if (passive) {
       // Whether or not the fixed reply is due. Somebody writing in is the
       // signal, and a conversation already inside the gap is one where the
       // prefix is even likelier to turn up next.
@@ -752,6 +1042,10 @@ function runWhatsApp(bot) {
 
     const decision = classify(msg, runtime);
     if (decision.kind !== 'command') {
+      // An ordinary message the owner typed to somebody. Worth recording, and
+      // worth calling off anything the model was writing for that chat.
+      recordOutbound(decision.chatId, (msg.body || '').trim());
+
       // Quiet for ordinary messages you send people, loud for one that was
       // meant to be a command and was not read as one. Without this a dropped
       // command looks exactly like a handler that never fired, and there is
@@ -764,11 +1058,7 @@ function runWhatsApp(bot) {
       return;
     }
 
-    const reply = runCommand(runtime, decision.text, {
-      cancelAll: (reason) => {
-        for (const chat of runtime.activeChats()) runtime.cancel(chat, reason);
-      },
-    });
+    const reply = runCommand(runtime, decision.text, commandHooks);
 
     console.log(`[${bot.name}] command "${decision.text || 'status'}": ${reply}`);
     if (!access.ownerCommandAck) return;
@@ -786,18 +1076,33 @@ function runWhatsApp(bot) {
     // SEND_API_ALLOW_ANY=false into a no-op in the configuration most people
     // start from, so a leaked key could message any number in the world.
     allows: (to) => sendCfg.allowAny || identity.named(to),
+    health: readHealth,
+
+    // The same commands as WhatsApp, through the same code, so the two cannot
+    // drift. This is what lets Discord steer it.
+    command: (text) => runCommand(runtime, text, commandHooks),
+
     deliver: (to, text) => {
       // A reply you approved replaces whatever the model was in the middle of
-      // writing for that conversation, rather than arriving alongside it.
-      if (runtime.cancel(to, 'sent by hand')) {
-        console.log(`[send] dropped the reply being written for ${to}`);
-      }
+      // writing for that conversation, rather than arriving alongside it. This
+      // also records it, so the transcript knows the question was answered and
+      // the next briefing does not draft a reply to it all over again.
+      recordOutbound(to, text);
+
       queue.push(async () => {
         await send(to, text);
         console.log(`[send] -> ${to}: ${text.slice(0, 120)}`);
       });
     },
   });
+
+
+  // Off unless DISCORD_STATUS_WEBHOOK is set. Started here rather than on
+  // 'ready', so that a session which never connects at all shows as red rather
+  // than never appearing, which is the same mistake as a monitor that only
+  // reports once there is something good to report.
+  const discord = new DiscordStatus();
+  discord.start(readHealth);
 
   // Safe, but useless, and it would otherwise present as "n8n is broken".
   if (server && !sendCfg.allowAny && identity.open) {
@@ -808,9 +1113,21 @@ function runWhatsApp(bot) {
     );
   }
 
-  installShutdown(bot, server ? [() => stopSendApi(server)] : []);
+  installShutdown(bot, [
+    // First, so that tearing the client down on purpose does not read as a
+    // session that dropped and start the reconnect loop chasing it.
+    () => {
+      closingDown = true;
+      clearTimeout(reconnectTimer);
+    },
+    // Paints the light red on the way out. A planned shutdown that left it
+    // green is indistinguishable from a process still running, which is the
+    // exact failure the light exists to make visible.
+    () => discord.stop(readHealth),
+    ...(server ? [() => stopSendApi(server)] : []),
+  ]);
   client.initialize();
-  return { client, runtime, identity, queue, server };
+  return { client, runtime, identity, queue, server, discord, readHealth };
 }
 
 async function runSim(bot) {

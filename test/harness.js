@@ -50,6 +50,10 @@ class ClientStub {
     // fetched, which the indicator has to survive without costing a reply.
     this.typingChat = null;
     this.chatRequests = [];
+    // Counted rather than recorded, because the reconnect loop is asserted on
+    // how many times it tried rather than on what it passed.
+    this.initCalls = 0;
+    this.destroyCalls = 0;
     lastClient = this;
   }
   async getChatById(id) {
@@ -64,7 +68,12 @@ class ClientStub {
   on(event, fn) {
     this.handlers[event] = fn;
   }
-  initialize() {}
+  initialize() {
+    this.initCalls += 1;
+  }
+  async destroy() {
+    this.destroyCalls += 1;
+  }
   async sendMessage(to, body) {
     this.sent.push({ to, body });
     // The real client hands back the Message it created, which is how the
@@ -116,6 +125,16 @@ const CONFIG_ENV = [
   'CONTACT_CACHE_FILE',
   'CONTACT_CACHE_TTL_DAYS',
   'CONTACT_RESOLVE_DELAY_MS',
+  'STATE_FILE',
+  'SETTINGS_FILE',
+  'HANDOVER_MINUTES',
+  'MEDIA_NOTICE',
+  'QUIET_HOURS',
+  'QUIET_HOURS_MODE',
+  'RECORD_OWN_REPLIES',
+  'DISCORD_STATUS_WEBHOOK',
+  'DISCORD_STATUS_SECONDS',
+  'DISCORD_STATUS_FILE',
   'IGNORE_OLDER_THAN_SECONDS',
   'ALLOW_GROUPS',
   'MAX_REPLIES_PER_HOUR',
@@ -158,6 +177,16 @@ function resetModules(env = {}) {
   // before env, so a scenario testing them can still turn them back on.
   process.env.REPLY_DEBOUNCE_MS = '0';
   process.env.OLLAMA_WARMUP = 'false';
+  // Off unless a scenario asks for it, and this one is not merely tidiness. The
+  // suite boots the runner a hundred times in one process against the real
+  // checkout, so a state file would be written by whichever section ran "/ai
+  // off" and then read back by every boot after it, quietly turning the rest of
+  // the suite off. The sections that do test persistence point it at a
+  // temporary directory of their own.
+  process.env.STATE_FILE = '';
+  // Same reason as STATE_FILE above: a setting changed by one section would
+  // otherwise be read back by every boot after it, against the real checkout.
+  process.env.SETTINGS_FILE = '';
   Object.assign(process.env, env);
   capturedBot = null;
   lastClient = null;
@@ -270,6 +299,7 @@ function bootRunner(env = {}, { pinMode = true } = {}) {
   const seen = [];
   const observed = [];
   const warmed = [];
+  const outbounds = [];
   const started = run({
     name: 'test',
     clientId: 'test',
@@ -279,6 +309,7 @@ function bootRunner(env = {}, { pinMode = true } = {}) {
     },
     // No auto() on purpose, so the runner's own fallback is what gets exercised.
     observe: (id, text) => observed.push({ id, text }),
+    outbound: (id, text) => outbounds.push({ id, text }),
     // Always present, unlike the real bot which leaves it off when the warm-up
     // is disabled. What is under test here is when the runner decides to call
     // it, which is a separate question from whether the assistant offers it.
@@ -289,6 +320,7 @@ function bootRunner(env = {}, { pinMode = true } = {}) {
     seen,
     observed,
     warmed,
+    outbounds,
     client,
     runtime: started && started.runtime,
     server: started && started.server,
@@ -2966,6 +2998,697 @@ async function main() {
       assert.strictEqual(broken.seen.length, 1, JSON.stringify(broken.seen));
       assert.strictEqual(broken.client.sent.length, 1);
     });
+  });
+
+  await section('attachments, which carry no text to answer', async () => {
+    // A voice note used to be dropped as an empty message: no reply to them,
+    // nothing in the transcript, and so nothing in the briefing either.
+    const note = bootDefaults();
+    await note.deliver({ type: 'ptt', body: '' });
+
+    check('a voice note is answered rather than dropped', () =>
+      assert.strictEqual(note.client.sent.length, 1, JSON.stringify(note.client.sent))
+    );
+    check('the reply says what could not be read, as a policy not an apology', () =>
+      assert.match(note.client.sent[0].body, /Unable to process voice notes/)
+    );
+    check('the fixed reply goes with it, so they still learn about the prefix', () =>
+      assert.match(note.client.sent[0].body, /Nobody is watching this number/)
+    );
+    check('and it never reaches the model', () => assert.strictEqual(note.seen.length, 0));
+
+    // The whole point: the owner hears about it.
+    const tracked = bootDefaults();
+    await tracked.deliver({ type: 'image', body: '' });
+    await tracked.deliver({ type: 'image', body: '' });
+    check('a second attachment inside the gap is recorded rather than answered', () => {
+      assert.strictEqual(tracked.client.sent.length, 1, JSON.stringify(tracked.client.sent));
+      assert.deepStrictEqual(
+        tracked.observed.map((o) => o.text),
+        ['(sent an image, which could not be read)']
+      );
+    });
+
+    // A captioned image is a message with words in it and always was.
+    const caption = bootDefaults();
+    await caption.deliver({ type: 'image', body: '/ai what is this' });
+    check('a caption is still answered on its words', () =>
+      assert.deepStrictEqual(
+        caption.seen.map((s) => s.text),
+        ['what is this']
+      )
+    );
+
+    // Everything WhatsApp calls a message that is not one. Answering these
+    // would text people about their own delivery receipts.
+    const noise = bootDefaults();
+    for (const type of ['e2e_notification', 'notification_template', 'reaction', 'revoked']) {
+      await noise.deliver({ type, body: '' });
+    }
+    check('receipts, reactions and key changes are still ignored', () => {
+      assert.strictEqual(noise.client.sent.length, 0, JSON.stringify(noise.client.sent));
+      assert.strictEqual(noise.observed.length, 0);
+    });
+
+    // In always mode the fixed line would announce that nobody is watching the
+    // number, on the one setting where the model answers everything.
+    const always = bootRunner({ REPLY_MODE: 'always' });
+    await always.deliver({ type: 'ptt', body: '' });
+    check('always mode explains the attachment without the fixed reply', () => {
+      assert.strictEqual(always.client.sent.length, 1, JSON.stringify(always.client.sent));
+      assert.doesNotMatch(always.client.sent[0].body, /Nobody is watching this number/);
+      assert.match(always.client.sent[0].body, /Unable to process voice notes/);
+    });
+
+    const silent = bootDefaults({ MEDIA_NOTICE: '' });
+    await silent.deliver({ type: 'ptt', body: '' });
+    check('an empty MEDIA_NOTICE leaves just the fixed reply', () =>
+      assert.match(silent.client.sent[0].body, /^Nobody is watching this number/)
+    );
+
+    const off = bootRunner({ REPLY_MODE: 'off' });
+    await off.deliver({ type: 'ptt', body: '' });
+    check('off still answers nothing, attachment or not', () =>
+      assert.strictEqual(off.client.sent.length, 0)
+    );
+  });
+
+  await section('away and mode surviving a restart', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatllama-state-'));
+    const stateFile = path.join(dir, 'state.json');
+
+    // "/ai away 1w" is a promise to whoever writes in, and pm2 restarting at
+    // four in the morning is not the owner cancelling it.
+    const first = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    await first.command('/ai away 2h at the dentist');
+    check('the away is written out', () => assert.ok(fs.existsSync(stateFile)));
+
+    const second = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    check('a restart comes back still away', () =>
+      assert.ok(second.runtime.awayUntil > Date.now(), String(second.runtime.awayUntil))
+    );
+    check('with the same wording', () =>
+      assert.strictEqual(second.runtime.awayText, 'at the dentist')
+    );
+    check('and it says so at startup rather than silently', () =>
+      assert.match(String(second.runtime.restored), /still away/)
+    );
+
+    await second.deliver({ body: 'you around' });
+    check('and people are told the reason it was set with', () =>
+      assert.match(second.client.sent[0].body, /at the dentist/)
+    );
+
+    // The stored value is the moment it ends, not what was left of it, so time
+    // spent down counts. Away for two hours, down for three, no longer away.
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({ version: 1, state: { mode: 'auto', awayUntil: Date.now() - 1000, awayText: 'over' } })
+    );
+    const expired = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    check('an away that ran out while it was down is simply over', () => {
+      assert.strictEqual(expired.runtime.awayUntil, 0);
+      assert.strictEqual(expired.runtime.awayText, '');
+    });
+
+    // Away with no end set has no number to store, and JSON has no Infinity.
+    const forever = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    await forever.command('/ai away');
+    const reborn = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    check('away with no end set survives too', () =>
+      assert.strictEqual(reborn.runtime.awayUntil, Infinity)
+    );
+
+    // Switching it off is the one people would most notice being undone.
+    const stopped = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    await stopped.command('/ai off');
+    const stillOff = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    check('off survives a restart rather than quietly coming back on', () =>
+      assert.strictEqual(stillOff.runtime.effectiveMode(), 'off')
+    );
+
+    const backOn = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    await backOn.command('/ai on');
+    const andOn = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    check('and turning it back on is remembered as well', () =>
+      assert.strictEqual(andOn.runtime.effectiveMode(), 'auto')
+    );
+
+    fs.writeFileSync(stateFile, 'not json at all');
+    const damaged = bootRunner({ STATE_FILE: stateFile, REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    check('a damaged file starts from REPLY_MODE rather than refusing to start', () => {
+      assert.strictEqual(damaged.runtime.effectiveMode(), 'auto');
+      assert.strictEqual(damaged.runtime.restored, null);
+    });
+
+    const nowhere = bootRunner({ STATE_FILE: '', REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    await nowhere.command('/ai off');
+    check('STATE_FILE empty writes nothing at all', () =>
+      assert.strictEqual(fs.readFileSync(stateFile, 'utf8'), 'not json at all')
+    );
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await section('when the owner answers somebody themselves', async () => {
+    // The transcript used to show a question with nobody answering it, so the
+    // briefing reported an outstanding request that had been dealt with, and
+    // drafted a reply to something already replied to.
+    const hand = bootRunner({ REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    await hand.deliver({ body: 'you around saturday' });
+    await hand.command('yes saturday works', { to: 'x@lid' });
+
+    check('what the owner typed reaches the transcript', () =>
+      assert.deepStrictEqual(hand.outbounds, [{ id: 'x@lid', text: 'yes saturday works' }])
+    );
+
+    // The bot's own messages arrive on the same event, and reading those back
+    // would put the assistant's replies in as the owner's.
+    const own = bootRunner({ REPLY_MODE: 'always' });
+    await own.deliver({ body: 'hello' });
+    await own.client.emit('message_create', {
+      fromMe: true,
+      to: 'x@lid',
+      timestamp: now(),
+      id: { _serialized: 'sent-1' },
+      body: 'ok',
+    });
+    await settle();
+    check('the bot does not read its own reply back as the owner writing', () =>
+      assert.deepStrictEqual(own.outbounds, [])
+    );
+
+    // A group acknowledgement is visible to everyone in it, and the inbound
+    // side refuses groups for the same reason.
+    const group = bootRunner({ REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    await group.command('something', { to: 'g@g.us' });
+    check('a message to a group is not recorded', () =>
+      assert.deepStrictEqual(group.outbounds, [])
+    );
+
+    const stranger = bootRunner({
+      REPLY_MODE: 'auto',
+      OWNER_COMMANDS: 'any',
+      ALLOWED_CONTACTS: '447700900123',
+    });
+    await stranger.command('hello there', { to: 'someone@lid' });
+    check('nor one to somebody outside the allowlist', () =>
+      assert.deepStrictEqual(stranger.outbounds, [])
+    );
+
+    // Somebody who has started typing an answer of their own does not also
+    // want the model's arriving underneath it, written as it was without
+    // knowing theirs existed. Handle is held open so the owner's message lands
+    // while the reply is genuinely still being written.
+    resetModules({ REPLY_MODE: 'always', OWNER_COMMANDS: 'any' });
+    axiosStub = makeAxios();
+    const { run: runRaced } = require(srcFile('lib', 'runner.js'));
+
+    let release = null;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    const racedOut = [];
+    runRaced({
+      name: 'test',
+      clientId: 'test',
+      handle: async () => {
+        await held;
+        return 'ok';
+      },
+      outbound: (id, text) => racedOut.push({ id, text }),
+    });
+    const racedClient = lastClient;
+
+    await racedClient.emit('message', { from: 'x@lid', timestamp: now(), body: 'you around' });
+    await settle();
+    await racedClient.emit('message_create', {
+      fromMe: true,
+      to: 'x@lid',
+      timestamp: now(),
+      id: { _serialized: 'own-raced' },
+      body: 'I am, yes',
+    });
+    await settle();
+    release();
+    await settle();
+    await settle();
+
+    check('a reply being written is dropped when the owner answers first', () =>
+      assert.strictEqual(racedClient.sent.length, 0, JSON.stringify(racedClient.sent))
+    );
+    check('and what the owner actually sent is what gets recorded', () =>
+      assert.deepStrictEqual(racedOut, [{ id: 'x@lid', text: 'I am, yes' }])
+    );
+  });
+
+  await section('keeping out of a conversation the owner has taken over', async () => {
+    // The fixed reply says nobody is watching this number. Sending it seconds
+    // after the owner replied in person is a lie with the evidence directly
+    // above it, and an approved draft goes out unmarked, so the other person
+    // believes they are talking to a human and would then be answered by a bot.
+    const taken = bootRunner({
+      REPLY_MODE: 'auto',
+      OWNER_COMMANDS: 'any',
+      AUTO_REPLY_GAP_MINUTES: '0',
+    });
+    await taken.deliver({ body: 'you around saturday' });
+    check('the fixed reply goes out while nobody is there', () =>
+      assert.strictEqual(taken.client.sent.length, 1)
+    );
+
+    await taken.command('yes saturday works', { to: 'x@lid' });
+    await taken.deliver({ body: 'great, shall I book it then' });
+
+    check('but not once the owner has answered them', () =>
+      assert.strictEqual(taken.client.sent.length, 1, JSON.stringify(taken.client.sent))
+    );
+    check('and what they said is still recorded for the briefing', () =>
+      assert.deepStrictEqual(
+        taken.observed.map((o) => o.text),
+        ['great, shall I book it then']
+      )
+    );
+
+    // always mode is where this matters most: the model would otherwise answer
+    // underneath the owner mid-conversation.
+    const busy = bootRunner({ REPLY_MODE: 'always', OWNER_COMMANDS: 'any' });
+    await busy.command('I will call you in a minute', { to: 'x@lid' });
+    await busy.deliver({ body: 'ok sounds good' });
+    check('the model does not answer underneath the owner', () => {
+      assert.strictEqual(busy.seen.length, 0, JSON.stringify(busy.seen));
+      assert.strictEqual(busy.client.sent.length, 0);
+    });
+
+    // Somebody who types the prefix has asked the assistant a question on
+    // purpose, and refusing it answers a question nobody asked.
+    const asked = bootRunner({ REPLY_MODE: 'auto', OWNER_COMMANDS: 'any' });
+    await asked.command('give me two minutes', { to: 'x@lid' });
+    await asked.deliver({ body: '/ai what is the postcode' });
+    check('an explicit request still reaches the model', () =>
+      assert.deepStrictEqual(
+        asked.seen.map((s) => s.text),
+        ['what is the postcode']
+      )
+    );
+
+    // Going away outranks anything inferred from having replied recently.
+    const gone = bootRunner({
+      REPLY_MODE: 'auto',
+      OWNER_COMMANDS: 'any',
+      AUTO_REPLY_GAP_MINUTES: '0',
+    });
+    await gone.command('on my way', { to: 'x@lid' });
+    await gone.command('/ai away 2h on a train');
+    await gone.deliver({ body: 'you there?' });
+    check('"/ai away" hands every conversation back to the bot', () =>
+      assert.ok(
+        gone.client.sent.some((s) => /on a train/.test(s.body)),
+        JSON.stringify(gone.client.sent)
+      )
+    );
+
+    const off = bootRunner({
+      REPLY_MODE: 'auto',
+      OWNER_COMMANDS: 'any',
+      HANDOVER_MINUTES: '0',
+      AUTO_REPLY_GAP_MINUTES: '0',
+    });
+    await off.command('replying myself', { to: 'x@lid' });
+    await off.deliver({ body: 'you around' });
+    check('HANDOVER_MINUTES=0 goes back to answering regardless', () =>
+      assert.strictEqual(off.client.sent.length, 1, JSON.stringify(off.client.sent))
+    );
+  });
+
+  await section('losing the WhatsApp session', async () => {
+    // The process stays up, pm2 sees nothing wrong, and a bot answering nobody
+    // looks exactly like a quiet afternoon. So it has to say so.
+    const dropped = bootRunner({ N8N_WEBHOOK_URL: 'http://n8n.test/hook' });
+    await dropped.client.emit('ready');
+    axiosStub.calls.length = 0;
+
+    await dropped.client.emit('disconnected', 'NAVIGATION');
+    await settle();
+
+    const events = axiosStub.posts().map((p) => p.body && p.body.event);
+    check('a dropped session is reported rather than only logged', () =>
+      assert.ok(events.includes('session_lost'), JSON.stringify(events))
+    );
+    check('and the runtime knows it is down', () =>
+      assert.strictEqual(dropped.runtime.connection, 'disconnected')
+    );
+
+    // Said once on the change, not on every retry.
+    axiosStub.calls.length = 0;
+    await dropped.client.emit('disconnected', 'NAVIGATION');
+    await settle();
+    check('a repeat of the same state is not reported twice', () =>
+      assert.strictEqual(axiosStub.posts().length, 0)
+    );
+
+    axiosStub.calls.length = 0;
+    await dropped.client.emit('ready');
+    await settle();
+    check('coming back up is reported too', () =>
+      assert.ok(
+        axiosStub.posts().some((p) => p.body && p.body.event === 'session_restored'),
+        JSON.stringify(axiosStub.posts().map((p) => p.body))
+      )
+    );
+    check('and the runtime is ready again', () =>
+      assert.strictEqual(dropped.runtime.connection, 'ready')
+    );
+
+    // Reaching a QR means the stored session is gone and no amount of
+    // reconnecting will fix it, so this one needs a person.
+    const scan = bootRunner({ N8N_WEBHOOK_URL: 'http://n8n.test/hook' });
+    await scan.client.emit('qr', 'code');
+    await settle();
+    check('needing a scan is reported as well', () =>
+      assert.ok(
+        axiosStub.posts().some((p) => p.body && p.body.status === 'needs_scan'),
+        JSON.stringify(axiosStub.posts().map((p) => p.body))
+      )
+    );
+  });
+
+  await section('settings changed by command rather than by editing .env', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatllama-settings-'));
+    const file = path.join(dir, 'settings.json');
+    const env = { SETTINGS_FILE: file, OWNER_COMMANDS: 'any', REPLY_MODE: 'auto' };
+
+    const one = bootRunner({ ...env, AUTO_REPLY_TEXT: 'from env' });
+    await one.deliver({ body: 'hello' });
+    check('the fixed reply starts as .env says', () =>
+      assert.strictEqual(one.client.sent[0].body, 'from env')
+    );
+
+    await one.command('/ai set auto_reply back tomorrow');
+    await one.deliver({ body: 'hello again', from: 'y@lid' });
+    check('and changes without a restart', () =>
+      assert.strictEqual(
+        (one.client.sent.find((m) => m.to === 'y@lid') || {}).body,
+        'back tomorrow'
+      )
+    );
+
+    const two = bootRunner({ ...env, AUTO_REPLY_TEXT: 'from env' });
+    await two.deliver({ body: 'hello' });
+    check('the change survives a restart', () =>
+      assert.strictEqual(two.client.sent[0].body, 'back tomorrow')
+    );
+
+    await two.command('/ai reset auto_reply');
+    await two.deliver({ body: 'hello', from: 'z@lid' });
+    check('and clearing it puts .env back rather than leaving a second copy', () =>
+      assert.strictEqual((two.client.sent.find((m) => m.to === 'z@lid') || {}).body, 'from env')
+    );
+
+    // A value typed wrong on a phone must be refused, not stored. Half of these
+    // are read by things that would fail much later and much less obviously.
+    const bad = bootRunner(env);
+    const cases = [
+      ['/ai set gap not-a-number', /number of minutes/],
+      ['/ai set quiet 25:00-08:00', /24-hour times/],
+      ['/ai set quiet_mode loud', /one of auto, off/],
+      ['/ai set nonsense 5', /not a setting/],
+    ];
+    for (const [input, expected] of cases) {
+      const logs = await capturingLogs(() => bad.command(input));
+      check(`${JSON.stringify(input)} is refused and says why`, () =>
+        assert.ok(logs.some((l) => expected.test(l)), logs.join(' | '))
+      );
+    }
+
+    // The timings live on the runtime as numbers, so they have to be pushed in
+    // rather than waiting to be read.
+    const live = bootRunner(env);
+    await live.command('/ai set handover 90');
+    check('a timing setting reaches the running state, not just the file', () =>
+      assert.strictEqual(live.runtime.handoverMs, 90 * 60 * 1000)
+    );
+
+    // Nothing about how the process is wired up is reachable from a command. A
+    // command arriving over the send endpoint must not be able to reconfigure
+    // the endpoint that let it in.
+    const locked = bootRunner(env);
+    for (const key of ['send_api_port', 'port', 'key', 'webhook', 'send_api_key_sha512']) {
+      const logs = await capturingLogs(() => locked.command(`/ai set ${key} 9999`));
+      check(`"${key}" cannot be set from a command`, () =>
+        assert.ok(logs.some((l) => /not a setting/.test(l)), logs.join(' | '))
+      );
+    }
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await section('quiet hours', async () => {
+    // Local time, because whoever sets it is thinking in their own hours.
+    const { parseWindow, insideWindow } = require(srcFile('lib', 'settings.js'));
+    const at = (h, m = 0) => new Date(2026, 0, 1, h, m);
+
+    check('a window that runs past midnight covers the night', () => {
+      assert.ok(insideWindow('22:00-08:00', at(23)));
+      assert.ok(insideWindow('22:00-08:00', at(3)));
+      assert.ok(insideWindow('22:00-08:00', at(7, 59)));
+    });
+    check('and not the working day', () => {
+      assert.ok(!insideWindow('22:00-08:00', at(8)));
+      assert.ok(!insideWindow('22:00-08:00', at(14)));
+    });
+    check('a window inside one day behaves the ordinary way', () => {
+      assert.ok(insideWindow('09:00-17:00', at(12)));
+      assert.ok(!insideWindow('09:00-17:00', at(20)));
+    });
+    check('nonsense is not a window rather than being taken as one', () => {
+      assert.strictEqual(parseWindow('22:00'), null);
+      assert.strictEqual(parseWindow('99:99-08:00'), null);
+      // Equal ends is either no time at all or the whole day, and guessing
+      // which somebody meant is how a bot goes silent for a week.
+      assert.strictEqual(parseWindow('09:00-09:00'), null);
+    });
+
+    // The point of it: always mode stops answering directly overnight, without
+    // anyone having to remember the away command every evening.
+    const nowHour = new Date().getHours();
+    const pad = (n) => String((n + 24) % 24).padStart(2, '0');
+    const covering = `${pad(nowHour - 1)}:00-${pad(nowHour + 2)}:00`;
+    const outside = `${pad(nowHour + 3)}:00-${pad(nowHour + 4)}:00`;
+
+    const night = bootRunner({ REPLY_MODE: 'always', QUIET_HOURS: covering });
+    await night.deliver({ body: 'you around' });
+    check('inside quiet hours the model is not answering directly', () => {
+      assert.strictEqual(night.seen.length, 0, JSON.stringify(night.seen));
+      assert.strictEqual(night.runtime.effectiveMode(), 'auto');
+    });
+
+    const day = bootRunner({ REPLY_MODE: 'always', QUIET_HOURS: outside });
+    await day.deliver({ body: 'you around' });
+    check('outside them the configured mode is what runs', () => {
+      assert.strictEqual(day.runtime.effectiveMode(), 'always');
+      assert.strictEqual(day.seen.length, 1);
+    });
+
+    const silent = bootRunner({
+      REPLY_MODE: 'always',
+      QUIET_HOURS: covering,
+      QUIET_HOURS_MODE: 'off',
+    });
+    await silent.deliver({ body: 'you around' });
+    check('QUIET_HOURS_MODE=off answers nothing at all', () =>
+      assert.strictEqual(silent.client.sent.length, 0)
+    );
+
+    // A bot switched off stays off whatever the clock says.
+    const stopped = bootRunner({ REPLY_MODE: 'off', QUIET_HOURS: covering });
+    check('quiet hours never make a switched-off bot start answering', () =>
+      assert.strictEqual(stopped.runtime.effectiveMode(), 'off')
+    );
+  });
+
+  await section('health and commands over HTTP', async () => {
+    const KEY = 'health-key-0123456789abcdef';
+    const HASH = crypto.createHash('sha512').update(KEY).digest('hex');
+
+    const call = (port, { method = 'GET', route = '/health', key = KEY, body = null } = {}) =>
+      new Promise((resolve, reject) => {
+        const payload = body === null ? '' : JSON.stringify(body);
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port,
+            method,
+            path: route,
+            headers: {
+              'content-type': 'application/json',
+              'content-length': Buffer.byteLength(payload),
+              ...(key ? { 'x-api-key': key } : {}),
+            },
+          },
+          (res) => {
+            let text = '';
+            res.on('data', (c) => (text += c));
+            res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(text || '{}') }));
+          }
+        );
+        req.on('error', reject);
+        req.end(payload);
+      });
+
+    const r = bootRunner({
+      SEND_API_PORT: '0',
+      SEND_API_KEY_SHA512: HASH,
+      OWNER_COMMANDS: 'any',
+      REPLY_MODE: 'auto',
+    });
+    // listen() is asynchronous, so address() is null until it has bound.
+    await new Promise((resolve) =>
+      r.server.listening ? resolve() : r.server.once('listening', resolve)
+    );
+    const port = r.server.address().port;
+
+    try {
+      // Down before the session connects. A monitor that goes green while
+      // WhatsApp is disconnected is worse than no monitor at all.
+      const before = await call(port);
+      check('health is 503 until the WhatsApp session is ready', () => {
+        assert.strictEqual(before.status, 503);
+        assert.strictEqual(before.body.status, 'down');
+      });
+
+      await r.client.emit('ready');
+      const after = await call(port);
+      check('and 200 once it is', () => {
+        assert.strictEqual(after.status, 200);
+        assert.strictEqual(after.body.status, 'up');
+        assert.strictEqual(after.body.connection, 'ready');
+      });
+      check('carrying what a status light needs', () => {
+        assert.strictEqual(typeof after.body.uptimeSeconds, 'number');
+        assert.strictEqual(typeof after.body.queueDepth, 'number');
+        assert.strictEqual(after.body.mode, 'auto');
+      });
+
+      const noKey = await call(port, { key: null });
+      check('health is behind the key like everything else', () =>
+        assert.strictEqual(noKey.status, 401)
+      );
+
+      const cmd = await call(port, {
+        method: 'POST',
+        route: '/command',
+        body: { text: 'away 2h at the dentist' },
+      });
+      check('a command over HTTP does the same as one over WhatsApp', () => {
+        assert.strictEqual(cmd.status, 200);
+        assert.match(cmd.body.reply, /Away for 2 hours/);
+        assert.ok(r.runtime.awayUntil > Date.now());
+      });
+
+      const status = await call(port, {
+        method: 'POST',
+        route: '/command',
+        body: { text: 'status' },
+      });
+      check('and status comes back as text to show somebody', () =>
+        assert.match(status.body.reply, /away for another/)
+      );
+
+      const empty = await call(port, { method: 'POST', route: '/command', body: {} });
+      check('an empty command is refused', () => assert.strictEqual(empty.status, 400));
+
+      const unauth = await call(port, {
+        method: 'POST',
+        route: '/command',
+        key: 'wrong-key',
+        body: { text: 'off' },
+      });
+      check('and a bad key cannot switch the assistant off', () => {
+        assert.strictEqual(unauth.status, 401);
+        assert.notStrictEqual(r.runtime.mode, 'off');
+      });
+    } finally {
+      await new Promise((resolve) => r.server.close(resolve));
+    }
+  });
+
+  await section('going back and forth through approved drafts', async () => {
+    // The loop this has to support: they write, the fixed reply goes out, you
+    // approve a draft, they answer that, and from then on every reply of yours
+    // is one you approved from a briefing. Nothing automatic may speak into
+    // that, and the briefings have to keep coming or the loop has no next step.
+    const MIN = 60000;
+    const { RuntimeState } = require(srcFile('lib', 'state.js'));
+    const rt = new RuntimeState({
+      mode: 'auto',
+      autoGapMs: 60 * MIN,
+      followUpMs: 15 * MIN,
+      handoverMs: 30 * MIN,
+    });
+
+    const t0 = Date.now();
+    const at = (m) => t0 + m * MIN;
+
+    rt.noteInbound('x', at(0));
+    rt.noteAutoReply('x', at(0));
+    rt.noteHandedOver('x', at(5));
+
+    check('a reply two minutes after you approved gets nothing automatic', () => {
+      assert.ok(rt.isHandedOver('x', at(7)));
+      assert.ok(!rt.shouldAutoReply('x', at(7)));
+    });
+    rt.noteInbound('x', at(7));
+
+    // The question this section exists for. The handover is measured from your
+    // last reply, so at forty minutes it has lapsed. That on its own would send
+    // the canned line into the middle of a conversation you were part of half
+    // an hour ago, which is why the gap is the second guard rather than the
+    // same guard written twice: it is measured from their last message.
+    check('and one after the handover has lapsed still gets nothing', () => {
+      assert.ok(!rt.isHandedOver('x', at(40)));
+      assert.ok(!rt.shouldAutoReply('x', at(40)));
+    });
+
+    check('the fixed reply comes back only once they are genuinely a fresh contact', () =>
+      assert.ok(rt.shouldAutoReply('x', at(90)))
+    );
+
+    // Approving another draft puts the window back, so the loop sustains itself
+    // for as long as you keep answering, and lapses when you stop.
+    rt.noteHandedOver('x', at(40));
+    check('approving again extends it rather than running out mid-conversation', () =>
+      assert.ok(rt.isHandedOver('x', at(65)))
+    );
+
+    // And the briefings have to keep arriving throughout, or there is nothing
+    // to approve and the conversation simply stops.
+    resetModules({ SUMMARY_IDLE_MINUTES: '0.01', N8N_WEBHOOK_URL: 'http://n8n.test/hook' });
+    axiosStub = makeAxios({
+      '/api/generate': async () => ({
+        data: { response: '{"urgency":"today","wants":"w","deadline":"","draft_reply":"11 works"}' },
+      }),
+    });
+    require(srcFile('bots', 'assistant.js'));
+
+    capturedBot.observe('sam@lid', 'shall I book it then', { from: 'sam@lid' });
+    // SUMMARY_IDLE_MINUTES is 0.01, so the briefing fires after 600ms. The
+    // generation then runs through the digest queue, hence the second wait.
+    await wait(900);
+    await settle();
+    await settle();
+
+    const briefing = axiosStub
+      .posts()
+      .map((p) => p.body)
+      .find((b) => b && b.event === 'conversation_summary');
+
+    check('a message that was only observed still produces a briefing', () =>
+      assert.ok(briefing, JSON.stringify(axiosStub.posts().map((p) => p.body && p.body.event)))
+    );
+    check('carrying the draft that keeps the loop going', () =>
+      assert.strictEqual(briefing.triage.draftReply, '11 works')
+    );
   });
 
   const failed = results.filter(([ok]) => !ok).length;

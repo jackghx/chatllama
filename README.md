@@ -436,6 +436,54 @@ n8n, no restart.
 | `/ai away 2h in a meeting` | Fixed replies for two hours, with that wording under `AUTO_REPLY_TEXT` |
 | `/ai away` | The same with no end time, until you send `/ai back` |
 | `/ai back` | Clears away and returns to the configured mode |
+| `/ai brief` | Writes every pending briefing now, rather than waiting for each conversation to go quiet |
+| `/ai settings` | Everything that can be changed by command, and whether it came from `.env` |
+| `/ai set gap 90` | Changes one, with no restart and no editing `.env` |
+| `/ai reset gap` | Puts one back to what `.env` says, or `reset all` for the lot |
+
+Away and the mode survive a restart. `/ai away 1w` is a promise to everyone who
+writes in, and pm2 restarting at four in the morning is not you cancelling it,
+so both are written to `STATE_FILE` and read back at startup, which says what it
+restored. What is stored is the moment the away ends rather than what is left of
+it, so time spent down still counts: away for a week, down on day three, still
+away until day seven. An away that ran out while it was down is simply over.
+Set `STATE_FILE=` empty to go back to starting from `REPLY_MODE` every time.
+
+### Settings you can change without a restart
+
+`/ai settings` lists them. They are a layer on top of `.env` rather than a
+replacement for it: nothing is stored until you change it, an untouched setting
+reads straight through, and `/ai reset <name>` puts it back. That ordering is
+what stops the file becoming a second, silent copy of your configuration.
+
+| Name | What it is |
+| --- | --- |
+| `model` | Model used for replies |
+| `summary_model` | Model used for briefings, empty uses the reply model |
+| `prompt` | The persona, replacing the prompt file while it is set |
+| `auto_reply` | The fixed reply in auto mode |
+| `media_notice` | Added when somebody sends an attachment |
+| `gap` | `AUTO_REPLY_GAP_MINUTES` |
+| `follow_up` | `FOLLOW_UP_MINUTES` |
+| `handover` | `HANDOVER_MINUTES` |
+| `max_per_day` | `AUTO_REPLY_MAX_PER_DAY` |
+| `summary_idle` | `SUMMARY_IDLE_MINUTES` |
+| `quiet` / `quiet_mode` | Quiet hours, below |
+| `contacts` | `ALLOWED_CONTACTS`, re-resolved in the background |
+
+Nothing that decides how the process is wired up is here: not the port, not the
+API key digest, not the webhook URL. A command arriving over the send endpoint
+must never be able to reconfigure the endpoint that let it in.
+
+### Quiet hours
+
+`QUIET_HOURS=22:00-08:00`, or `/ai set quiet 22:00-08:00`, is the standing
+version of away: the same behaviour, on a clock, so it does not have to be
+remembered every evening. It may run past midnight, and it is local time,
+because whoever sets it is thinking in their own hours.
+
+`QUIET_HOURS_MODE` decides what it does, `auto` for the fixed reply or `off` for
+silence. Neither can make a bot you switched off start answering again.
 
 Durations are a number and a unit, spelled however you like:
 
@@ -529,11 +577,33 @@ curl -X POST http://127.0.0.1:3111/send \
 It answers `202` once the message is queued rather than waiting for it to go
 out, since the queue can be sitting behind a two-minute generation. A message
 sent this way cancels whatever the model was writing for that conversation, so
-your reply replaces the machine's rather than arriving alongside it.
+your reply replaces the machine's rather than arriving alongside it, and it is
+recorded as yours in the transcript.
+
+That last part matters more than it sounds. It applies to messages you type on
+your own phone as well: the bot notices, drops the pending briefing for that
+conversation, and stops writing whatever it had started. Without it the
+transcript showed a question with nobody answering it, so the next briefing
+reported an outstanding request that you had in fact dealt with, and offered you
+a draft reply to something you had already replied to.
 
 It will not start without a key, or with one that is not a SHA-512 digest. An
 endpoint reachable on a LAN with no credential is a spam relay wired to a real
 phone number.
+
+### Health and commands over the same endpoint
+
+`GET /health` reports whether it is actually working, which the process being up
+does not tell you. It answers 200 only when the WhatsApp session is connected
+and 503 otherwise, so anything that understands status codes and nothing else
+still gets this right.
+
+`POST /command` takes `{"text":"away 2h at the dentist"}` and runs the same
+owner commands as WhatsApp, through the same code, returning `{"reply":"..."}`.
+Both are behind the same `x-api-key`. Together they are what lets Discord steer
+the assistant without ChatLlama being reachable from the internet: see
+[docs/discord-control.md](docs/discord-control.md), which also covers keeping a
+green or red status message in a channel.
 
 It will only message a number you named in `ALLOWED_CONTACTS`, unless you set
 `SEND_API_ALLOW_ANY=true`. An empty `ALLOWED_CONTACTS` means anyone may write
@@ -625,8 +695,16 @@ once per breach rather than once per message, or it would become the runaway
 loop it is there to stop. `RATE_LIMIT_NOTICE` sets the wording, and an empty
 value sends nothing.
 
-**Images, stickers and voice notes.** Skipped rather than turned into an empty
-prompt. A photo with a caption is answered on the caption.
+**Images, stickers and voice notes.** Never sent to the model, which cannot read
+any of them, but no longer dropped either. A photo with a caption is answered on
+the caption. One without gets the fixed reply plus `MEDIA_NOTICE`, which says
+what came through and could not be read, and it is recorded in the transcript so
+your briefing says "Sam sent a voice note" rather than saying nothing at all.
+
+They are held to `AUTO_REPLY_GAP_MINUTES` like any other fixed reply, so five
+photos in a row are one message back and not five. Delivery receipts, key
+changes, reactions and group joins arrive on the same event and are still
+ignored: those are not somebody writing to you.
 
 **The backlog.** whatsapp-web.js replays recent history when it connects.
 Messages older than `IGNORE_OLDER_THAN_SECONDS`, default 30, are dropped, so a
@@ -659,6 +737,7 @@ with comments.
 | `CONTACT_CACHE_FILE` | Where resolved identifiers are kept, default `.cache/identity.json` |
 | `CONTACT_CACHE_TTL_DAYS` | How long before a resolved identifier is looked up again, default 30 |
 | `CONTACT_RESOLVE_DELAY_MS` | Pause between lookups, which WhatsApp rate limits, default 500 |
+| `STATE_FILE` | Where away and the mode set by command are kept between runs, default `.cache/state.json`. Empty starts from `REPLY_MODE` every time |
 | `CAPTURE_IDS` | Logs each sender and whether they matched, answering nobody |
 | `OWNER_COMMANDS` | `off`, `self` or `any`, default `self` |
 | `OWNER_COMMAND_ACK` | Whether a command is confirmed back to you, default true |
@@ -668,10 +747,18 @@ with comments.
 | `REPLY_DEBOUNCE_MS` | Quiet needed before a reply is started, default 2000, so a question sent in parts costs one generation. 0 starts at once |
 | `TYPING_INDICATOR` | Show "typing..." while a reply is being written, default true |
 | `RATE_LIMIT_NOTICE` | Sent once when a conversation hits the cap, empty sends nothing |
+| `HANDOVER_MINUTES` | How long the bot keeps out after you answer somebody yourself, default 30, zero disables |
+| `RECORD_OWN_REPLIES` | Keep what you send by hand in the transcript, default true |
+| `QUIET_HOURS` | Hours to behave as though away, e.g. `22:00-08:00`, empty disables |
+| `QUIET_HOURS_MODE` | `auto` or `off`, default `auto` |
+| `SETTINGS_FILE` | Where settings changed by command are kept, default `.cache/settings.json` |
+| `DISCORD_STATUS_WEBHOOK` | A Discord webhook to keep a green/red status message in, empty disables |
+| `DISCORD_STATUS_SECONDS` | How often it is updated, default 60 |
+| `MEDIA_NOTICE` | Added when somebody sends an attachment with no caption, `{what}` becoming "a voice note" and so on. Empty sends nothing extra |
 | `IGNORE_OLDER_THAN_SECONDS` | Drops the backlog replayed on connect, default 30 |
 | `N8N_WEBHOOK_URL` | Optional, empty disables webhook logging |
 | `WEBHOOK_IN_SIM` | Fire the webhook from terminal simulation too, default false |
-| `SUMMARY_IDLE_MINUTES` | Silence before a conversation is summarised, default 10, zero disables |
+| `SUMMARY_IDLE_MINUTES` | Silence before a conversation is summarised, default 5, zero disables |
 | `SUMMARY_MAX_MESSAGES` | Summarise anyway at this many exchanges, default 15 |
 | `SUMMARY_FORMAT` | `json` for fields n8n can branch on, or `prose`, default `json` |
 | `SUMMARY_MODEL` | A better model for the briefing, empty uses `ASSISTANT_MODEL` |
@@ -738,6 +825,16 @@ It sends two kinds of event, told apart by the `event` field on one URL:
 | --- | --- | --- |
 | `ai_message` | Every exchange | The message in, the reply as sent, and `automatic` saying whether the model wrote it |
 | `conversation_summary` | Once, when the conversation goes quiet | A briefing, the triage fields, the exchange count, the transcript |
+| `session_lost` | The WhatsApp session drops, fails to authenticate, or needs a QR code scanning | `status` and a `detail` line |
+| `session_restored` | It comes back | `status` |
+
+The session events are the ones to wire to something that actually reaches you.
+A dropped session is the only failure here with no symptom: the process is still
+running, pm2 sees nothing wrong, and a bot answering nobody looks exactly like a
+quiet afternoon, so the first you hear of it is the messages that were never
+covered. It reconnects on its own, backing off from ten seconds to five minutes,
+but `needs_scan` means the stored session is gone and no amount of retrying will
+fix it.
 
 Notify yourself on the summary and leave the other one alone. A busy Saturday
 becomes one message rather than twenty. Route `ai_message` somewhere quiet, or

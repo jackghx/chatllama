@@ -87,6 +87,42 @@ class Identity {
     return this.open || this.matches.has(chatId);
   }
 
+  /**
+   * Replaces the allowlist while the bot is running.
+   *
+   * The constructor is where the entries are turned into matchable identifiers,
+   * so this rebuilds those from scratch rather than adding to them: taking
+   * somebody out of the list has to take them out of the allowlist too, which
+   * is the direction that goes wrong if you only ever add. The cache is kept, so
+   * a number that was already resolved costs no lookup on the way back in.
+   *
+   * The lookups run in the background. Anyone who was already matched keeps
+   * working throughout, and a number that has not resolved yet is matched by
+   * its phone-number form in the meantime, which is the same position a fresh
+   * start is in.
+   */
+  reload(entries, client) {
+    const rebuilt = new Identity({
+      entries,
+      cacheFile: this.cacheFile,
+      ttlDays: this.ttlMs / DAY_MS,
+      delayMs: this.delayMs,
+    });
+
+    this.configured = rebuilt.configured;
+    this.numbers = rebuilt.numbers;
+    this.matches = rebuilt.matches;
+    this.cached = rebuilt.cached;
+    this.unresolved = [];
+
+    if (!client) return Promise.resolve();
+    return this.resolve(client)
+      .then(() => {
+        for (const line of this.report()) console.log(line);
+      })
+      .catch((err) => console.warn('[contacts] could not resolve the new list:', err.message));
+  }
+
   readCache() {
     if (!this.cacheFile) return {};
     try {

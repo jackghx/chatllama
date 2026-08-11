@@ -50,6 +50,29 @@ class Digest {
     if (state && name) state.meta = { ...state.meta, name };
   }
 
+  /**
+   * Throws away what was accumulating for a conversation, without writing a
+   * briefing from it.
+   *
+   * Used when the owner has answered that person themselves. The whole point of
+   * a briefing is to tell them about a conversation they have not read, and a
+   * conversation they have just replied to by hand is the clearest possible
+   * evidence that they have. Sending one anyway means a notification about
+   * something already dealt with, carrying a drafted reply to a question that
+   * has already been answered.
+   *
+   * Anything they say after this starts a fresh one, which is correct: that is
+   * a new exchange they have not seen.
+   */
+  drop(id) {
+    const state = this.pending.get(id);
+    if (!state) return false;
+
+    clearTimeout(state.timer);
+    this.pending.delete(id);
+    return true;
+  }
+
   // Deleting first means a flush already under way cannot be started twice by
   // the timer and the shutdown handler racing each other.
   flush(id, reason) {

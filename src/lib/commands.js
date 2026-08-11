@@ -1,4 +1,5 @@
 const { access } = require('../config');
+const { shared: settings, NAMES } = require('./settings');
 
 // A number and a unit, and nothing else: no dates, no clock times, no natural
 // language. Months and years are deliberately absent. Neither has a fixed
@@ -73,19 +74,25 @@ function describe(runtime) {
     parts.push(`away for another ${humanDuration(left)}`);
   }
 
+  if (runtime.isQuiet && runtime.isQuiet()) {
+    parts.push(`inside quiet hours (${settings.get('quiet')}), so ${runtime.quietMode}`);
+  } else if (settings.get('quiet')) {
+    parts.push(`quiet hours ${settings.get('quiet')}`);
+  }
+
   if (mode === 'auto') {
-    const fixed = runtime.awayText || access.autoReplyText;
+    const fixed = runtime.awayText || settings.get('auto_reply');
     // Trimmed because this is read on a phone, and the configured wording runs
     // to a couple of sentences.
     const shown = fixed.length > 60 ? `${fixed.slice(0, 57)}...` : fixed;
     parts.push(fixed ? `saying "${shown}"` : 'no fixed reply set, so nothing is sent');
   }
 
-  parts.push(
-    access.allowedContacts.length
-      ? `${access.allowedContacts.length} allowed contact(s)`
-      : 'anyone can write in'
-  );
+  const contacts = settings.get('contacts');
+  parts.push(contacts.length ? `${contacts.length} allowed contact(s)` : 'anyone can write in');
+
+  const changed = settings.changedNames;
+  if (changed.length) parts.push(`${changed.length} setting(s) changed: ${changed.join(', ')}`);
 
   return `${parts.join('. ')}.`;
 }
@@ -135,9 +142,17 @@ function parseAway(arg) {
  * bot would go quiet for new messages while still finishing, and sending, the
  * answers that were in flight when you switched it off.
  */
-function runCommand(runtime, input, { cancelAll } = {}) {
+function runCommand(runtime, input, { cancelAll, brief } = {}) {
   const [word, ...rest] = String(input || '').trim().split(/\s+/);
   const arg = rest.join(' ');
+
+  // Every branch below that changes anything ends by writing it out, so that a
+  // restart does not undo an away you set days ago. Wrapping the switch is what
+  // stops a branch added later forgetting to.
+  const saving = (reply) => {
+    runtime.save();
+    return reply;
+  };
 
   switch (word.toLowerCase()) {
     case '':
@@ -149,7 +164,7 @@ function runCommand(runtime, input, { cancelAll } = {}) {
       runtime.awayUntil = 0;
       runtime.awayText = '';
       if (cancelAll) cancelAll('switched off');
-      return `Off. Nothing gets answered until you send ${access.commandPrefix} on.`;
+      return saving(`Off. Nothing gets answered until you send ${access.commandPrefix} on.`);
 
     case 'on':
       // Falling back to auto matters when REPLY_MODE is itself off, where
@@ -157,7 +172,7 @@ function runCommand(runtime, input, { cancelAll } = {}) {
       runtime.mode = access.replyMode === 'off' ? 'auto' : access.replyMode;
       runtime.awayUntil = 0;
       runtime.awayText = '';
-      return `On, ${runtime.effectiveMode()} mode.`;
+      return saving(`On, ${runtime.effectiveMode()} mode.`);
 
     case 'away': {
       const { minutes, text, bad } = parseAway(arg);
@@ -175,22 +190,75 @@ function runCommand(runtime, input, { cancelAll } = {}) {
       runtime.awayUntil = minutes === null ? Infinity : Date.now() + minutes * 60000;
       runtime.awayText = text;
 
+      // Saying you have gone outranks anything inferred from you having replied
+      // to somebody twenty minutes ago. Without this, the conversations you
+      // were most recently part of are the ones that would go unanswered.
+      runtime.clearHandovers();
+
       const when = minutes === null ? `until you send ${access.commandPrefix} back` : `for ${humanDuration(minutes)}`;
       const saying = text ? `Saying "${text}".` : 'Using the configured fixed reply.';
-      return `Away ${when}. ${saying}`;
+      return saving(`Away ${when}. ${saying}`);
     }
 
     case 'back':
       runtime.awayUntil = 0;
       runtime.awayText = '';
-      return `Back, ${runtime.effectiveMode()} mode.`;
+      return saving(`Back, ${runtime.effectiveMode()} mode.`);
+
+    // Everything pending, now, rather than waiting for each conversation to go
+    // quiet on its own. What you send when you land, or come out of a meeting.
+    case 'brief': {
+      if (!brief) return 'Briefings are not available here.';
+      const count = brief();
+      if (!count) return 'Nothing waiting. Every conversation has already been briefed.';
+      return `Writing ${count} briefing(s) now. They will arrive as they finish.`;
+    }
+
+    // The settings that can be changed without editing .env and restarting.
+    case 'set': {
+      const [name, ...value] = rest;
+      if (!name) return `Settings: ${NAMES.join(', ')}. Send "set <name>" to see one.`;
+
+      const key = name.toLowerCase();
+      // No value is a question rather than a mistake, and answering it is more
+      // use than refusing it.
+      if (!value.length) {
+        if (!NAMES.includes(key)) return `"${key}" is not a setting. Try: ${NAMES.join(', ')}.`;
+        return `${key} = ${settings.describe(key)}${settings.changed(key) ? ' (set)' : ' (from .env)'}`;
+      }
+
+      return settings.set(key, value.join(' ')).reply;
+    }
+
+    // The way back from a value typed wrong on a phone, which is why a change
+    // is stored on top of the configuration rather than over it.
+    case 'unset':
+    case 'reset':
+      return settings.clear((rest[0] || '').toLowerCase() || 'all').reply;
+
+    case 'settings':
+      return settings.report().join('\n');
 
     default:
-      return `Not a command. Try ${access.commandPrefix} then status, off, on, away 2h, or back.`;
+      return (
+        `Not a command. Try ${access.commandPrefix} then status, off, on, away 2h, ` +
+        'back, brief, settings, set <name> <value>, or reset <name>.'
+      );
   }
 }
 
-const WORDS = ['status', 'off', 'on', 'away', 'back'];
+const WORDS = [
+  'status',
+  'off',
+  'on',
+  'away',
+  'back',
+  'brief',
+  'set',
+  'unset',
+  'reset',
+  'settings',
+];
 
 /**
  * Whether what follows the prefix is one of the commands rather than a question.

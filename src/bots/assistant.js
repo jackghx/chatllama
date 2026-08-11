@@ -13,8 +13,18 @@ const { SerialQueue } = require('../lib/queue');
 const { notify } = require('../lib/webhook');
 const { loadSystemPrompt, loadSummaryPrompt, loadTriagePrompt } = require('../lib/prompt');
 const { run } = require('../lib/runner');
+const { shared: settings } = require('../lib/settings');
 
-const { text: systemPrompt, source: promptSource } = loadSystemPrompt();
+const { text: filePrompt, source: promptSource } = loadSystemPrompt();
+
+/**
+ * The persona in force.
+ *
+ * A prompt set by command wins over the file, and clearing it puts the file
+ * back. Read for every reply rather than captured once, or changing it would
+ * need a restart, which is the thing being avoided.
+ */
+const personaNow = () => settings.get('prompt') || filePrompt;
 const summaryPrompt = loadSummaryPrompt();
 const triagePrompt = loadTriagePrompt();
 
@@ -161,7 +171,7 @@ async function summarise(conversationId, { messages, meta, reason }) {
     raw = await generate({
       // The briefing runs after the reply has gone out, so nobody is waiting on
       // it and it can afford a better model than the one answering.
-      model: summaryCfg.model || cfg.model,
+      model: settings.get('summary_model') || settings.get('model'),
       prompt: [
         structured ? triagePrompt : summaryPrompt,
         '',
@@ -244,6 +254,36 @@ function observe(conversationId, text, ctx) {
 }
 
 /**
+ * Records a message the owner sent that person themselves.
+ *
+ * Two ways in: typed on their own phone, or approved from a briefing and handed
+ * back through the send endpoint. Neither used to be recorded anywhere, and the
+ * consequences were the same in both cases. The transcript showed a person
+ * asking a question and nobody answering it, so the next briefing reported an
+ * outstanding request that had in fact been dealt with, and drafted a reply to
+ * a question that had already been replied to.
+ *
+ * The pending briefing goes with it. A conversation the owner has just answered
+ * by hand is one they have plainly read, which is the one thing a briefing
+ * exists to fix.
+ */
+function outbound(conversationId, text) {
+  // The transcript is held in memory and never written anywhere, and it exists
+  // so that the model and the briefing know what has already been said. Without
+  // it the next briefing contradicts the owner: they answered on Saturday, the
+  // transcript does not show it, and the draft goes back to asking whether
+  // Saturday works. Off is available for anyone who would rather their own
+  // words never entered it, at that cost.
+  if (cfg.recordOwnReplies) memory.push(conversationId, `Owner: ${text}`);
+
+  // Regardless of the above. A briefing about a conversation the owner has just
+  // replied to is a notification about something already dealt with.
+  if (digest.drop(conversationId)) {
+    console.log(`[digest] ${conversationId}: answered by hand, so no briefing`);
+  }
+}
+
+/**
  * The fixed reply. No model in the path, so it is instant and cannot drift.
  *
  * It still goes through the disclosure marker and the transcript rather than
@@ -282,13 +322,13 @@ function auto(conversationId, text, ctx) {
 async function handle(conversationId, text, ctx) {
   const history = memory.lines(conversationId);
   const isFirstReply = history.length === 0;
-  const prompt = [systemPrompt, ...history, `User: ${text}`, `${LABEL}:`].join('\n');
+  const prompt = [personaNow(), ...history, `User: ${text}`, `${LABEL}:`].join('\n');
 
   let raw;
   let truncated = false;
   try {
     raw = await generate({
-      model: cfg.model,
+      model: settings.get('model'),
       prompt,
       // Without these the model writes the user's next message and answers it.
       stop: ['User:', '\nUser:', `\n${LABEL}:`],
@@ -363,16 +403,24 @@ run({
   handle,
   auto,
   observe,
+  outbound,
   // Left off entirely when it is switched off, so the runner has nothing to
   // call rather than a function that quietly does nothing.
   // The persona, because it opens every prompt this bot sends and reading it is
   // the largest single cost in a reply. Warming with it means the cache is
   // already holding it by the time somebody asks something.
   warm: ollamaCfg.warmup
-    ? () => warmUp({ model: cfg.model, prompt: systemPrompt })
+    ? () => warmUp({ model: settings.get('model'), prompt: personaNow() })
     : undefined,
   // Who the conversation is with, once the runner has managed to look them up.
   rename: (conversationId, name) => digest.rename(conversationId, name),
+  // "/ai brief" and the same over HTTP. Returns how many were waiting, so the
+  // answer can say whether anything actually happened.
+  brief: () => {
+    const waiting = digest.pending.size;
+    digest.flushAll('asked');
+    return waiting;
+  },
   // Pending summaries only exist in memory, so a restart would drop them.
   shutdown: () => digest.flushAll(),
 });

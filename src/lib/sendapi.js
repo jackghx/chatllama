@@ -44,7 +44,7 @@ function respond(res, status, body) {
  * It will not start unauthenticated: a send endpoint reachable on a LAN with no
  * credential is a spam relay wired to a real phone number.
  */
-function startSendApi({ port, host, keyHash, maxPerMinute, allows, deliver }) {
+function startSendApi({ port, host, keyHash, maxPerMinute, allows, deliver, health, command }) {
   if (port === null || port === undefined) return null;
 
   if (!keyHash) {
@@ -81,11 +81,32 @@ function startSendApi({ port, host, keyHash, maxPerMinute, allows, deliver }) {
   };
 
   const server = http.createServer((req, res) => {
-    if (req.url !== '/send') return respond(res, 404, { error: 'not found' });
-    if (req.method !== 'POST') return respond(res, 405, { error: 'use POST' });
+    // The path is read without its query string, so that a monitor appending
+    // a cache-buster does not turn a health check into a 404.
+    const route = String(req.url || '').split('?')[0];
+
+    if (!['/send', '/health', '/command'].includes(route)) {
+      return respond(res, 404, { error: 'not found' });
+    }
+
+    // Behind the key like everything else. What mode the assistant is in, who
+    // it is connected as and how far behind it is are not things to hand out
+    // unauthenticated, and an open endpoint here would also be a free way to
+    // find out whether the box is up.
     if (!keyMatches(req.headers['x-api-key'], keyHash)) {
       return respond(res, 401, { error: 'bad or missing x-api-key' });
     }
+
+    if (route === '/health') {
+      if (req.method !== 'GET') return respond(res, 405, { error: 'use GET' });
+      const state = health ? health() : { status: 'unknown' };
+      // 503 rather than 200 with a field to read, so that anything which only
+      // understands status codes still reports this correctly. A monitor that
+      // goes green while the WhatsApp session is down is worse than none.
+      return respond(res, state.status === 'up' ? 200 : 503, state);
+    }
+
+    if (req.method !== 'POST') return respond(res, 405, { error: 'use POST' });
 
     let size = 0;
     let oversize = false;
@@ -113,6 +134,23 @@ function startSendApi({ port, host, keyHash, maxPerMinute, allows, deliver }) {
         payload = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
       } catch {
         return respond(res, 400, { error: 'body is not JSON' });
+      }
+
+      if (route === '/command') {
+        if (!command) return respond(res, 404, { error: 'commands are not available' });
+
+        const text = String((payload && payload.text) || '').trim();
+        if (!text) return respond(res, 400, { error: 'text is required' });
+
+        // Charged against the same budget as a send. A command is cheap, but
+        // an endpoint that will run one as fast as it is asked is a way to
+        // switch the assistant on and off a thousand times a second.
+        if (!affordable()) return respond(res, 429, { error: 'too many requests' });
+
+        // Answered rather than queued, unlike a send: every command is a
+        // synchronous change to state that returns a line of text, and the
+        // caller wants that line. Discord in particular has three seconds.
+        return respond(res, 200, { reply: command(text) });
       }
 
       const to = String((payload && payload.to) || '').trim();

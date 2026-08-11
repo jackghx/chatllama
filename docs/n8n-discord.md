@@ -183,7 +183,7 @@ building properly:
 | Name | Value | Inline |
 | --- | --- | --- |
 | Urgency | `{{ $json.body.triage ? $json.body.triage.urgency : "unknown" }}` | true |
-| By | `{{ $json.body.triage && $json.body.triage.deadline ? $json.body.triage.deadline : "no deadline" }}` | true |
+| Deadline | `{{ $json.body.triage && $json.body.triage.deadline ? $json.body.triage.deadline : "None" }}` | true |
 | Draft | `{{ $json.body.triage && $json.body.triage.draftReply ? $json.body.triage.draftReply : "nothing drafted" }}` | false |
 
 Both guards are load bearing. `triage` is `null` whenever the model did not
